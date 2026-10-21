@@ -11,13 +11,13 @@ mod macos_terminal;
 mod mascot;
 mod mcp;
 mod ngrok;
-mod transport;
-mod security;
 mod process_runner;
+mod security;
 mod server;
 mod startup;
 mod state;
 mod theme;
+mod transport;
 mod workspace_tools;
 
 use crossterm::{
@@ -29,12 +29,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use devtools::DevtoolsBridge;
-use state::TransportKind;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use state::TransportKind;
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
@@ -1810,11 +1810,17 @@ async fn run_transport_select(
                 Line::from(format!("Current: {}   |   q: quit", current.label())),
                 Line::from(notice.clone()),
             ];
-            frame.render_widget(Paragraph::new(text).block(Block::default().title(" Transport ").borders(Borders::ALL)), frame.area());
+            frame.render_widget(
+                Paragraph::new(text)
+                    .block(Block::default().title(" Transport ").borders(Borders::ALL)),
+                frame.area(),
+            );
         })?;
         if event::poll(UI_POLL_INTERVAL)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 let selected = match key.code {
                     KeyCode::Char('1') => Some(TransportKind::TailscaleFunnel),
                     KeyCode::Char('2') => Some(TransportKind::Ngrok),
@@ -1832,7 +1838,8 @@ async fn run_transport_select(
                     // Tailscale routing before disabling this application's path.
                     let stale_binding = state.lock().await.funnel_binding.is_some();
                     if kind != TransportKind::TailscaleFunnel
-                        && (current == TransportKind::TailscaleFunnel || stale_binding) {
+                        && (current == TransportKind::TailscaleFunnel || stale_binding)
+                    {
                         if let Err(error) = transport::stop(state.clone()).await {
                             notice = format!("Cannot safely switch transport: {error}");
                             continue;
@@ -1906,12 +1913,18 @@ async fn run_app(
     }
 
     // Select transport without reinstalling. Existing ngrok configuration is preserved.
-    if !run_transport_select(terminal, state.clone()).await? { return Ok(()); }
+    if !run_transport_select(terminal, state.clone()).await? {
+        return Ok(());
+    }
     if state.lock().await.transport == TransportKind::Ngrok {
         let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
-        if !continue_run { return Ok(()); }
+        if !continue_run {
+            return Ok(());
+        }
         let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
-        if !continue_run { return Ok(()); }
+        if !continue_run {
+            return Ok(());
+        }
     }
 
     // Start services
@@ -5683,23 +5696,26 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('t') => {
-                            match transport::stop(state.clone()).await {
+                        KeyCode::Char('t') => match transport::stop(state.clone()).await {
+                            Err(error) => {
+                                let mut app = state.lock().await;
+                                app.transport_error = Some(error.clone());
+                                app.log(
+                                    "ERROR",
+                                    format!("Transport stop blocked restart: {error}"),
+                                );
+                            }
+                            Ok(()) => match transport::start(state.clone()).await {
+                                Ok(()) => {
+                                    state.lock().await.log("INFO", "Transport restarted".into())
+                                }
                                 Err(error) => {
                                     let mut app = state.lock().await;
                                     app.transport_error = Some(error.clone());
-                                    app.log("ERROR", format!("Transport stop blocked restart: {error}"));
+                                    app.log("ERROR", format!("Transport restart failed: {error}"));
                                 }
-                                Ok(()) => match transport::start(state.clone()).await {
-                                    Ok(()) => state.lock().await.log("INFO", "Transport restarted".into()),
-                                    Err(error) => {
-                                        let mut app = state.lock().await;
-                                        app.transport_error = Some(error.clone());
-                                        app.log("ERROR", format!("Transport restart failed: {error}"));
-                                    }
-                                }
-                            }
-                        }
+                            },
+                        },
                         KeyCode::Char('e') => {
                             let export_result = {
                                 let app = state.lock().await;
@@ -6029,7 +6045,8 @@ fn draw_ui(
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
         (Some(url), true) => url.clone(),
-        (Some(url), false) => url.strip_suffix(&app.mcp_path())
+        (Some(url), false) => url
+            .strip_suffix(&app.mcp_path())
             .map(transport::masked_url)
             .unwrap_or_else(|| MCP_URL_MASK.to_string()),
         (None, _) => "--".to_string(),

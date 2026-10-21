@@ -64,7 +64,10 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         app.ngrok_running = true;
         app.ngrok_url = Some(url.clone());
         app.log("INFO", "ngrok SDK tunnel started".into());
-        app.log("INFO", "ngrok public URL is available in the TUI (masked)".into());
+        app.log(
+            "INFO",
+            "ngrok public URL is available in the TUI (masked)".into(),
+        );
 
         if app.ngrok_domain.is_none() {
             if let Ok(parsed_url) = reqwest::Url::parse(&url) {

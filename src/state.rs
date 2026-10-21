@@ -333,7 +333,11 @@ pub enum TransportKind {
 }
 impl TransportKind {
     pub fn label(self) -> &'static str {
-        match self { Self::Ngrok => "ngrok", Self::TailscaleFunnel => "Tailscale Funnel", Self::Local => "local" }
+        match self {
+            Self::Ngrok => "ngrok",
+            Self::TailscaleFunnel => "Tailscale Funnel",
+            Self::Local => "local",
+        }
     }
 }
 
@@ -1025,7 +1029,9 @@ impl AppState {
         let transport = config.transport.unwrap_or_else(|| {
             if config.ngrok_authtoken.is_some() || config.ngrok_domain.is_some() {
                 TransportKind::Ngrok
-            } else { TransportKind::Local }
+            } else {
+                TransportKind::Local
+            }
         });
         let partner_binagotchy_seed = config.partner_binagotchy_seed.clone();
         let mascot_seed = if let Some(seed) = partner_binagotchy_seed.as_deref() {
@@ -1112,8 +1118,13 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
-        self.transport_url.as_ref()
-            .or_else(|| (self.transport == TransportKind::Ngrok).then_some(self.ngrok_url.as_ref()).flatten())
+        self.transport_url
+            .as_ref()
+            .or_else(|| {
+                (self.transport == TransportKind::Ngrok)
+                    .then_some(self.ngrok_url.as_ref())
+                    .flatten()
+            })
             .map(|url| format!("{url}{}", self.mcp_path()))
     }
 

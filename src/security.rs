@@ -1,16 +1,18 @@
 //! Request admission for original CatDesk. Must wrap ALL HTTP routes.
 //! Host/Origin never authenticate a request. Remote Funnel always requires a token,
 //! including when the public proxy forwards with a forged loopback Host header.
+use crate::state::{SharedState, TransportKind};
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use crate::state::{SharedState, TransportKind};
 
 fn token_eq(expected: &str, received: &str) -> bool {
-    if expected.len() != received.len() { return false; }
+    if expected.len() != received.len() {
+        return false;
+    }
     let mut difference = 0u8;
     for (a, b) in expected.bytes().zip(received.bytes()) {
         difference |= a ^ b;
@@ -35,30 +37,41 @@ fn funnel_auth_required(kind: TransportKind, owned: bool, pending_route: bool) -
 }
 
 fn origin_allowed(headers: &HeaderMap, allow_chatgpt: bool) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else { return true; };
-    matches!(origin.to_str().ok(), Some("https://chatgpt.com" | "https://chat.openai.com"))
-        && allow_chatgpt
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    matches!(
+        origin.to_str().ok(),
+        Some("https://chatgpt.com" | "https://chat.openai.com")
+    ) && allow_chatgpt
 }
 
 /// A stale Funnel must never become public merely because the user selected
 /// 'local' or 'ngrok'. The lifecycle manager refuses that transition too.
 /// This defense in depth rejects unexpected HTTP hosts even if a previous
 /// background Funnel has been left configured or the configuration was edited.
-pub async fn guard(
-    State(app): State<SharedState>,
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn guard(State(app): State<SharedState>, request: Request, next: Next) -> Response {
     let (kind, base_url, legacy_url, owned, pending_route, port, slug, read_only, safe_mode) = {
         let state = app.lock().await;
-        (state.transport, state.transport_url.clone(), state.ngrok_url.clone(),
-         state.tailscale_owned, state.funnel_binding.is_some(), state.port, state.mcp_slug.clone(), state.tool_mode.read_only(),
-         matches!(state.mode, crate::state::Mode::Computer)
-            && state.sandbox_enabled && !state.handoff_enabled)
+        (
+            state.transport,
+            state.transport_url.clone(),
+            state.ngrok_url.clone(),
+            state.tailscale_owned,
+            state.funnel_binding.is_some(),
+            state.port,
+            state.mcp_slug.clone(),
+            state.tool_mode.read_only(),
+            matches!(state.mode, crate::state::Mode::Computer)
+                && state.sandbox_enabled
+                && !state.handoff_enabled,
+        )
     };
     let headers = request.headers();
-    let host = headers.get(header::HOST)
-        .and_then(|value| value.to_str().ok()).unwrap_or("");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
     let local = loopback_host(host, port);
     let funnel_guard = funnel_auth_required(kind, owned, pending_route);
 
@@ -72,18 +85,26 @@ pub async fn guard(
         let health = format!("/{slug}");
         let mcp = format!("{health}/mcp");
         let health_ok = p == health && request.method() == Method::GET;
-        let mcp_ok = p == mcp && (request.method() == Method::GET
-            || request.method() == Method::POST || request.method() == Method::DELETE);
-        if !health_ok && !mcp_ok { return StatusCode::FORBIDDEN.into_response(); }
+        let mcp_ok = p == mcp
+            && (request.method() == Method::GET
+                || request.method() == Method::POST
+                || request.method() == Method::DELETE);
+        if !health_ok && !mcp_ok {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         let expected = std::env::var("CATDESK_MCP_BEARER_TOKEN").unwrap_or_default();
         if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        let supplied = headers.get(header::AUTHORIZATION)
+        let supplied = headers
+            .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
         if !supplied.is_some_and(|value| token_eq(&expected, value)) {
-            return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")])
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+            )
                 .into_response();
         }
         // No X-Forwarded-Host / Forwarded trust. Public Host comes from Tailscale.
@@ -115,11 +136,19 @@ mod tests {
     use super::*;
     #[test]
     fn persisted_funnel_binding_always_requires_authorization() {
-        for kind in [TransportKind::Ngrok, TransportKind::Local, TransportKind::TailscaleFunnel] {
+        for kind in [
+            TransportKind::Ngrok,
+            TransportKind::Local,
+            TransportKind::TailscaleFunnel,
+        ] {
             assert!(funnel_auth_required(kind, false, true));
         }
         assert!(funnel_auth_required(TransportKind::Local, true, false));
-        assert!(funnel_auth_required(TransportKind::TailscaleFunnel, false, false));
+        assert!(funnel_auth_required(
+            TransportKind::TailscaleFunnel,
+            false,
+            false
+        ));
         assert!(!funnel_auth_required(TransportKind::Local, false, false));
         assert!(!funnel_auth_required(TransportKind::Ngrok, false, false));
     }
@@ -149,7 +178,10 @@ mod tests {
     }
     #[test]
     fn public_host_does_not_accept_paths() {
-        assert_eq!(url_host(Some("https://mac.example.ts.net")), Some("mac.example.ts.net"));
+        assert_eq!(
+            url_host(Some("https://mac.example.ts.net")),
+            Some("mac.example.ts.net")
+        );
         assert_eq!(url_host(Some("https://mac.example.ts.net/x")), None);
         assert_eq!(url_host(Some("http://mac.example.ts.net")), None);
     }

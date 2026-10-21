@@ -8,7 +8,9 @@ use tokio::process::Command;
 
 fn json_str<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
     let mut current = v;
-    for key in keys { current = current.get(*key)?; }
+    for key in keys {
+        current = current.get(*key)?;
+    }
     current.as_str()
 }
 
@@ -28,23 +30,40 @@ pub fn public_hostname(status: &Value) -> Result<String, String> {
         .ok_or("Tailscale DNSName is unavailable; check MagicDNS and HTTPS certificates.")?
         .trim_end_matches('.');
     let labels: Vec<_> = host.split('.').collect();
-    if labels.len() < 3 || !host.ends_with(".ts.net") || labels.iter().any(|label| {
-        label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') ||
-        !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    }) {
+    if labels.len() < 3
+        || !host.ends_with(".ts.net")
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
         return Err("Tailscale did not return a safe *.ts.net hostname.".into());
     }
     Ok(host.to_owned())
 }
 
 async fn tailscale(args: &[&str]) -> Result<String, String> {
-    let output = tokio::time::timeout(Duration::from_secs(12),
-        Command::new("tailscale").args(args).kill_on_drop(true).output())
-        .await.map_err(|_| "Tailscale CLI timed out".to_owned())?
-        .map_err(|_| "Tailscale CLI is not installed or executable".to_owned())?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(12),
+        Command::new("tailscale")
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Tailscale CLI timed out".to_owned())?
+    .map_err(|_| "Tailscale CLI is not installed or executable".to_owned())?;
     if !output.status.success() {
         // CLI stderr can include URLs, so intentionally don't surface it.
-        return Err(format!("Tailscale command failed ({}). Check login, MagicDNS, HTTPS, and Funnel permissions.", output.status));
+        return Err(format!(
+            "Tailscale command failed ({}). Check login, MagicDNS, HTTPS, and Funnel permissions.",
+            output.status
+        ));
     }
     String::from_utf8(output.stdout).map_err(|_| "Tailscale returned non-UTF-8 output".into())
 }
@@ -53,25 +72,37 @@ async fn tailscale(args: &[&str]) -> Result<String, String> {
 fn port_443_in_status(v: &Value) -> Result<bool, String> {
     let root = v.as_object().ok_or("Invalid Funnel status JSON root")?;
     // Unknown nonempty configuration schemas must not be treated as an empty port.
-    if root.keys().any(|name| !matches!(name.as_str(), "Web" | "AllowFunnel" | "TCP" | "Services")) {
+    if root
+        .keys()
+        .any(|name| !matches!(name.as_str(), "Web" | "AllowFunnel" | "TCP" | "Services"))
+    {
         return Err("Unrecognized Funnel status schema; refusing HTTPS/443 modification".into());
     }
     // Modern Tailscale may list separately advertised node Services. An empty
     // Services object is harmless; an active/unknown Service must never be
     // ignored when claiming exclusive ownership of HTTPS/443.
-    if let Some(services) = root.get("Services") {
-        if !services.as_object().is_some_and(|entries| entries.is_empty()) {
-            return Err("Tailscale has additional or malformed Services; HTTPS/443 ownership is ambiguous".into());
-        }
+    if let Some(services) = root.get("Services")
+        && !services
+            .as_object()
+            .is_some_and(|entries| entries.is_empty())
+    {
+        return Err(
+            "Tailscale has additional or malformed Services; HTTPS/443 ownership is ambiguous"
+                .into(),
+        );
     }
     let mut occupied = false;
     for field in ["Web", "AllowFunnel"] {
         if let Some(value) = root.get(field) {
-            let endpoints = value.as_object().ok_or("Invalid Funnel status endpoint map")?;
+            let endpoints = value
+                .as_object()
+                .ok_or("Invalid Funnel status endpoint map")?;
             for (key, value) in endpoints {
                 if key.rsplit(':').next() == Some("443") {
                     // Status contains HTTPS/443 even when AllowFunnel is false: Serve owns it.
-                    if field == "Web" || value == &Value::Bool(true) { occupied = true; }
+                    if field == "Web" || value == &Value::Bool(true) {
+                        occupied = true;
+                    }
                 }
             }
         }
@@ -85,8 +116,7 @@ fn port_443_in_status(v: &Value) -> Result<bool, String> {
 
 async fn funnel_status() -> Result<Value, String> {
     let raw = tailscale(&["funnel", "status", "--json"]).await?;
-    serde_json::from_str(&raw)
-        .map_err(|_| "Tailscale returned malformed Funnel status JSON".into())
+    serde_json::from_str(&raw).map_err(|_| "Tailscale returned malformed Funnel status JSON".into())
 }
 
 pub async fn funnel_443_active() -> Result<bool, String> {
@@ -99,21 +129,30 @@ pub async fn funnel_443_active() -> Result<bool, String> {
 /// deliberately rejects *any* existing listener in local/ngrok mode rather
 /// than attempting to infer that another route is harmless.
 fn any_existing_routing(config: &Value) -> Result<bool, String> {
-    let obj = config.as_object().ok_or("Unknown Tailscale ServeConfig schema")?;
-    if obj.keys().any(|name| !matches!(name.as_str(), "Web" | "AllowFunnel" | "TCP" | "Services")) {
+    let obj = config
+        .as_object()
+        .ok_or("Unknown Tailscale ServeConfig schema")?;
+    if obj
+        .keys()
+        .any(|name| !matches!(name.as_str(), "Web" | "AllowFunnel" | "TCP" | "Services"))
+    {
         return Err("Unknown Tailscale ServeConfig fields".into());
     }
     // Tailscale 1.92+ includes service-level status in some JSON responses.
     // Treat ANY present service as a potential listener rather than silently
     // assuming node-level TCP/Web maps are the full routing picture.
     if let Some(services) = obj.get("Services") {
-        let services = services.as_object()
+        let services = services
+            .as_object()
             .ok_or("Invalid Tailscale Services map")?;
-        if !services.is_empty() { return Ok(true); }
+        if !services.is_empty() {
+            return Ok(true);
+        }
     }
     for field in ["Web", "AllowFunnel", "TCP"] {
         if let Some(value) = obj.get(field) {
-            let endpoints = value.as_object()
+            let endpoints = value
+                .as_object()
                 .ok_or("Invalid Tailscale ServeConfig listener map")?;
             if !endpoints.is_empty() {
                 return Ok(true);
@@ -131,7 +170,9 @@ pub async fn other_routing_active() -> Result<bool, String> {
 /// Tailscale HTTPS/443 handler and Funnel permission directed at OUR listener.
 /// On an unknown schema or partial route, fail closed.
 fn matches_owned_route(config: &Value, binding: &FunnelBinding) -> bool {
-    if !matches!(port_443_in_status(config), Ok(true)) { return false; }
+    if !matches!(port_443_in_status(config), Ok(true)) {
+        return false;
+    }
     let key = format!("{}:443", binding.hostname);
     let proxy = format!("http://127.0.0.1:{}", binding.port);
     config.pointer("/TCP/443/HTTPS").and_then(Value::as_bool) == Some(true)
@@ -161,9 +202,15 @@ fn matches_owned_route(config: &Value, binding: &FunnelBinding) -> bool {
 /// installed but its status is unknown, refuse to open the listener; a stale
 /// --bg Funnel may still be active and reverse proxy to the same local port.
 pub async fn local_start_safe(previously_exposed: bool) -> Result<(), String> {
-    let output = tokio::time::timeout(Duration::from_secs(12),
-        Command::new("tailscale").arg("version").kill_on_drop(true).output()).await
-        .map_err(|_| "Tailscale health check timed out; listener blocked".to_string())?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(12),
+        Command::new("tailscale")
+            .arg("version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Tailscale health check timed out; listener blocked".to_string())?;
     match output {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !previously_exposed => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
@@ -188,16 +235,27 @@ fn check_bearer() -> Result<String, String> {
 }
 
 async fn protected_local_probe(port: u16, slug: &str, token: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none()).build()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
         .map_err(|_| "Unable to create local health probe")?;
     let url = format!("http://127.0.0.1:{port}/{slug}");
-    let unauthorized = client.get(&url).send().await
+    let unauthorized = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|_| "Local MCP server is unreachable")?;
     if unauthorized.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Funnel blocked: MCP endpoint does not reject requests without credentials.".into());
+        return Err(
+            "Funnel blocked: MCP endpoint does not reject requests without credentials.".into(),
+        );
     }
-    let authorized = client.get(url).bearer_auth(token).send().await
+    let authorized = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
         .map_err(|_| "Authenticated local MCP probe failed")?;
     if !authorized.status().is_success() {
         return Err("Funnel blocked: local MCP endpoint rejected valid credentials.".into());
@@ -206,32 +264,43 @@ async fn protected_local_probe(port: u16, slug: &str, token: &str) -> Result<(),
 }
 
 async fn protected_public_probe(host: &str, slug: &str, token: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none()).build()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
         .map_err(|_| "Unable to create TLS health probe")?;
     let url = format!("https://{host}/{slug}");
     for attempt in 0..3u64 {
         // First prove an unauthenticated request is denied; never assume secrecy of URL.
         let blocked = client.get(&url).send().await;
         let allowed = client.get(&url).bearer_auth(token).send().await;
-        if let (Ok(a), Ok(b)) = (blocked, allowed) {
-            if a.status() == reqwest::StatusCode::UNAUTHORIZED && b.status().is_success() {
-                return Ok(());
-            }
+        if let (Ok(a), Ok(b)) = (blocked, allowed)
+            && a.status() == reqwest::StatusCode::UNAUTHORIZED
+            && b.status().is_success()
+        {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1 + attempt)).await;
     }
-    Err("Protected Funnel HTTPS probe failed (401 without token and 2xx with token required).".into())
+    Err(
+        "Protected Funnel HTTPS probe failed (401 without token and 2xx with token required)."
+            .into(),
+    )
 }
 
 pub async fn start(state: SharedState) -> Result<(), String> {
     let (kind, port, slug, safe_mode, stored_binding) = {
         let a = state.lock().await;
-        (a.transport, a.port, a.mcp_slug.clone(),
-         a.tool_mode.read_only()
-            && matches!(a.mode, crate::state::Mode::Computer)
-            && a.sandbox_enabled && !a.handoff_enabled,
-         a.funnel_binding.clone())
+        (
+            a.transport,
+            a.port,
+            a.mcp_slug.clone(),
+            a.tool_mode.read_only()
+                && matches!(a.mode, crate::state::Mode::Computer)
+                && a.sandbox_enabled
+                && !a.handoff_enabled,
+            a.funnel_binding.clone(),
+        )
     };
     match kind {
         TransportKind::Local => {
@@ -267,15 +336,21 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             let token = check_bearer()?;
             let version = tailscale(&["version"]).await?;
             let candidate = version.lines().next().unwrap_or("").trim_start_matches('v');
-            let parsed: Vec<u32> = candidate.split('.').take(3)
-                .map(|part| part.parse::<u32>().unwrap_or(0)).collect();
+            let parsed: Vec<u32> = candidate
+                .split('.')
+                .take(3)
+                .map(|part| part.parse::<u32>().unwrap_or(0))
+                .collect();
             if parsed.len() < 3 || (parsed[0], parsed[1], parsed[2]) < (1, 38, 3) {
                 return Err("Tailscale v1.38.3+ is required for Funnel.".into());
             }
             let status: Value = serde_json::from_str(&tailscale(&["status", "--json"]).await?)
                 .map_err(|_| "Malformed Tailscale status JSON")?;
             let hostname = public_hostname(&status)?;
-            let binding = FunnelBinding { hostname: hostname.clone(), port };
+            let binding = FunnelBinding {
+                hostname: hostname.clone(),
+                port,
+            };
             let route = funnel_status().await?;
             let occupied = port_443_in_status(&route)?;
             // Refuse publication while another Tailscale route is present.
@@ -284,8 +359,10 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             if !occupied && any_existing_routing(&route)? {
                 return Err("Other Tailscale Serve/Funnel routes are present; isolate this CatDesk listener before publishing".into());
             }
-            if occupied && (stored_binding.as_ref() != Some(&binding)
-                || !matches_owned_route(&route, &binding)) {
+            if occupied
+                && (stored_binding.as_ref() != Some(&binding)
+                    || !matches_owned_route(&route, &binding))
+            {
                 return Err("HTTPS/443 is occupied by a different or unverifiable route; refusing to take ownership.".into());
             }
             protected_local_probe(port, &slug, &token).await?;
@@ -299,7 +376,9 @@ pub async fn start(state: SharedState) -> Result<(), String> {
                 }
                 if let Err(error) = protected_public_probe(&hostname, &slug, &token).await {
                     // Preserve the guard: an active public route may still exist.
-                    return Err(format!("Existing protected Funnel route is unreachable: {error}"));
+                    return Err(format!(
+                        "Existing protected Funnel route is unreachable: {error}"
+                    ));
                 }
                 let mut app = state.lock().await;
                 app.transport_running = true;
@@ -334,7 +413,9 @@ pub async fn start(state: SharedState) -> Result<(), String> {
                 tailscale(&["funnel", "--https=443", "--set-path=/", "--bg", &target]).await?;
                 started = true;
                 if !matches_owned_route(&funnel_status().await?, &binding) {
-                    return Err("New Funnel HTTPS/443 mapping does not match the local listener.".into());
+                    return Err(
+                        "New Funnel HTTPS/443 mapping does not match the local listener.".into(),
+                    );
                 }
                 protected_public_probe(&hostname, &slug, &token).await?;
                 // Commit ownership metadata only after verified routing and TLS/auth.
@@ -342,10 +423,12 @@ pub async fn start(state: SharedState) -> Result<(), String> {
                 {
                     let mut app = state.lock().await;
                     app.funnel_binding = Some(binding.clone());
-                    app.persist_state().map_err(|_| "Could not persist verified Funnel ownership".to_string())?;
+                    app.persist_state()
+                        .map_err(|_| "Could not persist verified Funnel ownership".to_string())?;
                 }
                 Ok(())
-            }.await;
+            }
+            .await;
             if let Err(error) = result {
                 // Never call `tailscale funnel reset`: it would delete other services.
                 let cleanup = if started {
@@ -386,8 +469,12 @@ pub async fn start(state: SharedState) -> Result<(), String> {
                     a.transport_url = Some(base_url);
                     a.tailscale_owned = true;
                 }
-                return Err(if cleanup.is_ok() { error } else {
-                    format!("{error}; unable to verify Funnel cleanup, public endpoint remains locked")
+                return Err(if cleanup.is_ok() {
+                    error
+                } else {
+                    format!(
+                        "{error}; unable to verify Funnel cleanup, public endpoint remains locked"
+                    )
                 });
             }
             let mut a = state.lock().await;
@@ -425,7 +512,7 @@ pub async fn stop(state: SharedState) -> Result<(), String> {
             // Never use `tailscale funnel reset` or port-wide removal.
             tailscale(&["funnel", "--https=443", "--set-path=/", "off"]).await?;
             match funnel_443_active().await {
-                Ok(false) => {},
+                Ok(false) => {}
                 Ok(true) => return Err("Funnel HTTPS/443 remained active after shutdown".into()),
                 Err(error) => return Err(format!("Cannot verify Funnel removal: {error}")),
             }
@@ -441,8 +528,12 @@ pub async fn stop(state: SharedState) -> Result<(), String> {
     // The ownership marker stays in memory/on disk if status is ambiguous.
     if owned || had_binding {
         match other_routing_active().await {
-            Ok(false) => {},
-            Ok(true) => return Err("Tailscale still has Serve/Funnel routes; authorization guard retained".into()),
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(
+                    "Tailscale still has Serve/Funnel routes; authorization guard retained".into(),
+                );
+            }
             Err(e) => return Err(format!("Unable to verify complete Funnel shutdown: {e}")),
         }
     }
@@ -451,7 +542,8 @@ pub async fn stop(state: SharedState) -> Result<(), String> {
         let handle = a.ngrok_task.take();
         a.tailscale_owned = false;
         a.funnel_binding = None;
-        a.persist_state().map_err(|_| "Failed to save Funnel shutdown state".to_string())?;
+        a.persist_state()
+            .map_err(|_| "Failed to save Funnel shutdown state".to_string())?;
         a.ngrok_running = false;
         a.ngrok_url = None;
         a.transport_running = false;
@@ -460,7 +552,9 @@ pub async fn stop(state: SharedState) -> Result<(), String> {
         a.last_remote_activity_ms = None;
         handle
     };
-    if let Some(handle) = ngrok_task { handle.abort(); }
+    if let Some(handle) = ngrok_task {
+        handle.abort();
+    }
     Ok(())
 }
 
@@ -474,9 +568,15 @@ pub async fn monitor(state: SharedState) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
         let (kind, owned, expected_hostname, slug) = {
             let a = state.lock().await;
-            (a.transport, a.tailscale_owned,
-                a.transport_url.as_deref().and_then(|url| url.strip_prefix("https://"))
-                    .map(str::to_owned), a.mcp_slug.clone())
+            (
+                a.transport,
+                a.tailscale_owned,
+                a.transport_url
+                    .as_deref()
+                    .and_then(|url| url.strip_prefix("https://"))
+                    .map(str::to_owned),
+                a.mcp_slug.clone(),
+            )
         };
         if kind != TransportKind::TailscaleFunnel || !owned {
             delay = 30;
@@ -492,7 +592,10 @@ pub async fn monitor(state: SharedState) {
                 return Err("Tailscale hostname changed; do not reuse old MCP URL".to_string());
             }
             let route = funnel_status().await?;
-            let binding = FunnelBinding { hostname: host.clone(), port: state.lock().await.port };
+            let binding = FunnelBinding {
+                hostname: host.clone(),
+                port: state.lock().await.port,
+            };
             if !matches_owned_route(&route, &binding) {
                 return Err("Funnel HTTPS/443 routing does not match this listener".to_string());
             }
@@ -502,19 +605,28 @@ pub async fn monitor(state: SharedState) {
             let token = check_bearer()?;
             protected_public_probe(&host, &slug, &token).await?;
             Ok::<(), String>(())
-        }.await.is_ok();
+        }
+        .await
+        .is_ok();
         let mut a = state.lock().await;
-        if a.transport != TransportKind::TailscaleFunnel || !a.tailscale_owned { continue; }
+        if a.transport != TransportKind::TailscaleFunnel || !a.tailscale_owned {
+            continue;
+        }
         if online {
             a.transport_running = true;
             a.transport_error = None;
-            if was_down { a.log("INFO", "Tailscale routing recovered".into()); }
+            if was_down {
+                a.log("INFO", "Tailscale routing recovered".into());
+            }
             was_down = false;
             delay = 30;
         } else {
             a.transport_running = false;
-            a.transport_error = Some("Tailscale route or HTTPS probe unavailable; waiting for network".into());
-            if !was_down { a.log("WARN", "Tailscale routing unavailable".into()); }
+            a.transport_error =
+                Some("Tailscale route or HTTPS probe unavailable; waiting for network".into());
+            if !was_down {
+                a.log("WARN", "Tailscale routing unavailable".into());
+            }
             was_down = true;
             delay = (delay * 2).min(300);
         }
@@ -528,7 +640,12 @@ mod tests {
     fn hostname_validation() {
         let good = serde_json::json!({"BackendState":"Running", "Self":{"Online":true,"DNSName":"mac.tailnet.ts.net."}});
         assert_eq!(public_hostname(&good).unwrap(), "mac.tailnet.ts.net");
-        for dns in ["evil.com", "bad..ts.net", "-bad.ts.net", "bad.ts.net.evil.com"] {
+        for dns in [
+            "evil.com",
+            "bad..ts.net",
+            "-bad.ts.net",
+            "bad.ts.net.evil.com",
+        ] {
             assert!(public_hostname(&serde_json::json!({"BackendState":"Running", "Self":{"Online":true,"DNSName":dns}})).is_err());
         }
         assert!(public_hostname(&serde_json::json!({"BackendState":"Running", "Self":{"DNSName":"mac.tailnet.ts.net"}})).is_err());
@@ -536,25 +653,47 @@ mod tests {
     #[test]
     fn funnel_status_detects_serve_and_funnel() {
         assert!(!port_443_in_status(&serde_json::json!({})).unwrap());
-        assert!(port_443_in_status(&serde_json::json!({"Web":{"mac.tailnet.ts.net:443":{"Handlers":{}}}})).unwrap());
-        assert!(port_443_in_status(&serde_json::json!({"AllowFunnel":{"mac.tailnet.ts.net:443":true}})).unwrap());
+        assert!(
+            port_443_in_status(
+                &serde_json::json!({"Web":{"mac.tailnet.ts.net:443":{"Handlers":{}}}})
+            )
+            .unwrap()
+        );
+        assert!(
+            port_443_in_status(&serde_json::json!({"AllowFunnel":{"mac.tailnet.ts.net:443":true}}))
+                .unwrap()
+        );
         assert!(port_443_in_status(&serde_json::json!({"TCP":{"443":{"HTTPS":true}}})).unwrap());
-        assert!(!port_443_in_status(&serde_json::json!({"AllowFunnel":{"mac.tailnet.ts.net:8443":true}})).unwrap());
+        assert!(
+            !port_443_in_status(
+                &serde_json::json!({"AllowFunnel":{"mac.tailnet.ts.net:8443":true}})
+            )
+            .unwrap()
+        );
         assert!(port_443_in_status(&serde_json::json!([])).is_err());
         assert!(port_443_in_status(&serde_json::json!({"Unknown":{"443":true}})).is_err());
     }
     #[test]
     fn ownership_requires_exact_public_mapping() {
-        let binding = FunnelBinding { hostname: "mac.tailnet.ts.net".into(), port: 3200 };
+        let binding = FunnelBinding {
+            hostname: "mac.tailnet.ts.net".into(),
+            port: 3200,
+        };
         let route = serde_json::json!({
             "TCP":{"443":{"HTTPS":true}},
             "AllowFunnel":{"mac.tailnet.ts.net:443":true},
             "Web":{"mac.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3200"}}}}
         });
         assert!(matches_owned_route(&route, &binding));
-        let wrong_port = FunnelBinding { port: 3201, ..binding.clone() };
+        let wrong_port = FunnelBinding {
+            port: 3201,
+            ..binding.clone()
+        };
         assert!(!matches_owned_route(&route, &wrong_port));
-        let wrong_host = FunnelBinding { hostname: "other.tailnet.ts.net".into(), ..binding.clone() };
+        let wrong_host = FunnelBinding {
+            hostname: "other.tailnet.ts.net".into(),
+            ..binding.clone()
+        };
         assert!(!matches_owned_route(&route, &wrong_host));
         let mut disabled = route.clone();
         disabled["AllowFunnel"]["mac.tailnet.ts.net:443"] = serde_json::json!(false);
@@ -564,7 +703,8 @@ mod tests {
             serde_json::json!("http://127.0.0.1:7777");
         assert!(!matches_owned_route(&hijacked, &binding));
         let mut extra = route.clone();
-        extra["Web"]["mac.tailnet.ts.net:443"]["Handlers"]["/other"] = serde_json::json!({"Proxy":"http://127.0.0.1:7777"});
+        extra["Web"]["mac.tailnet.ts.net:443"]["Handlers"]["/other"] =
+            serde_json::json!({"Proxy":"http://127.0.0.1:7777"});
         assert!(!matches_owned_route(&extra, &binding));
         // A public route on another port can bypass a prematurely removed guard.
         let mut other_port = route.clone();
@@ -591,7 +731,10 @@ mod tests {
     #[test]
     fn detects_every_listener_for_local_safety() {
         assert!(!any_existing_routing(&serde_json::json!({})).unwrap());
-        assert!(!any_existing_routing(&serde_json::json!({"TCP":{}, "Web":{}, "AllowFunnel":{}})).unwrap());
+        assert!(
+            !any_existing_routing(&serde_json::json!({"TCP":{}, "Web":{}, "AllowFunnel":{}}))
+                .unwrap()
+        );
         for status in [
             serde_json::json!({"AllowFunnel":{"host.ts.net:8443":true}}),
             serde_json::json!({"Web":{"host.ts.net:10000":{"Handlers":{}}}}),
@@ -604,7 +747,10 @@ mod tests {
     }
     #[test]
     fn reject_extra_services_on_owned_https_443() {
-        let binding = FunnelBinding { hostname: "mac.tailnet.ts.net".into(), port: 3200 };
+        let binding = FunnelBinding {
+            hostname: "mac.tailnet.ts.net".into(),
+            port: 3200,
+        };
         let mut route = serde_json::json!({
             "TCP":{"443":{"HTTPS":true}},
             "AllowFunnel":{"mac.tailnet.ts.net:443":true},
@@ -613,12 +759,22 @@ mod tests {
         assert!(matches_owned_route(&route, &binding));
         route["Web"]["other.tailnet.ts.net:443"] = serde_json::json!({"Handlers":{}});
         assert!(!matches_owned_route(&route, &binding));
-        route.as_object_mut().unwrap().get_mut("Web").unwrap().as_object_mut().unwrap().remove("other.tailnet.ts.net:443");
+        route
+            .as_object_mut()
+            .unwrap()
+            .get_mut("Web")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("other.tailnet.ts.net:443");
         route["TCP"]["443"]["TCPForward"] = serde_json::json!("127.0.0.1:7777");
         assert!(!matches_owned_route(&route, &binding));
     }
     #[test]
     fn url_mask_does_not_include_slug() {
-        assert_eq!(masked_url("https://mac.tailnet.ts.net"), "https://mac.tailnet.ts.net/[secret]/mcp");
+        assert_eq!(
+            masked_url("https://mac.tailnet.ts.net"),
+            "https://mac.tailnet.ts.net/[secret]/mcp"
+        );
     }
 }
