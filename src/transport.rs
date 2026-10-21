@@ -696,6 +696,30 @@ mod tests {
         assert!(port_443_in_status(&serde_json::json!({"Unknown":{"443":true}})).is_err());
     }
     #[test]
+    fn observed_private_serve_route_does_not_grant_funnel_ownership() {
+        // Observed on macOS with Tailscale 1.104.1: `funnel status --json`
+        // includes the private Serve configuration, even when AllowFunnel
+        // is absent. This must remain a blocker for a new public binding.
+        let private_serve = serde_json::json!({
+            "TCP": { "8443": { "HTTPS": true } },
+            "Web": {
+                "catdesk-original-mac.tailb0b5b7.ts.net:8443": {
+                    "Handlers": {
+                        "/": { "Proxy": "http://127.0.0.1:40183" }
+                    }
+                }
+            }
+        });
+        assert!(!port_443_in_status(&private_serve).unwrap());
+        assert!(any_existing_routing(&private_serve).unwrap());
+        let binding = FunnelBinding {
+            hostname: "catdesk-original-mac.tailb0b5b7.ts.net".into(),
+            port: 40183,
+        };
+        assert!(!matches_owned_route(&private_serve, &binding));
+    }
+
+    #[test]
     fn ownership_requires_exact_public_mapping() {
         let binding = FunnelBinding {
             hostname: "mac.tailnet.ts.net".into(),
