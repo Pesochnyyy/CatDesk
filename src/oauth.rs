@@ -200,7 +200,7 @@ impl OAuthStore {
         self.tokens.retain(|_, grant| grant.expires > now);
     }
 
-    fn validate_authorization(&self, req: &AuthorizationRequest) -> Result<(), OAuthError> {
+    pub fn validate_authorization(&self, req: &AuthorizationRequest) -> Result<(), OAuthError> {
         if req.response_type != "code"
             || req.client_id != CLIENT_ID
             || req.redirect_uri != CHATGPT_CALLBACK

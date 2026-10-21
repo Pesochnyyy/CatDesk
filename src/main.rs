@@ -12,6 +12,7 @@ mod mascot;
 mod mcp;
 mod ngrok;
 mod oauth;
+mod oauth_http;
 mod process_runner;
 mod security;
 mod server;

@@ -2187,6 +2187,15 @@ mod tests {
             ("POST", "/layout/token-stats"),
             ("POST", "/layout/show-detail"),
             ("POST", "/binagotchy/partner"),
+            // OAuth R2 is a separate in-memory preview, NOT mounted here.
+            (
+                "GET",
+                "/.well-known/oauth-protected-resource/secret-slug/mcp",
+            ),
+            ("GET", "/.well-known/oauth-authorization-server"),
+            ("GET", "/authorize"),
+            ("POST", "/authorize/approve"),
+            ("POST", "/token"),
         ];
         for (method, path) in unprefixed {
             let request = match method {
