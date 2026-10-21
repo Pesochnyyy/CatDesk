@@ -76,9 +76,9 @@ pub fn router(
     router_with_oauth_admission(app_state, devtools, command_jobs, mcp_path, ui_events, None)
 }
 
-/// A test-injectable OAuth admission path. The production entry point always
-/// passes None; this cannot expose incomplete OAuth endpoints or tokens.
-fn router_with_oauth_admission(
+/// Explicit OAuth admission route used by integration tests and the R8
+/// owner-confirmed loopback acceptance mode. NEVER turn on public Funnel.
+pub(crate) fn router_with_oauth_admission(
     app_state: SharedState,
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
@@ -3345,6 +3345,107 @@ mod oauth_mcp_admission_tests {
             })
             .unwrap()
             .access_token
+    }
+
+    #[tokio::test]
+    async fn r8_loopback_shared_oauth_rejects_public_host_and_transport_switch() {
+        let root = temp_path("catdesk-r8-loopback");
+        std::fs::create_dir_all(&root).unwrap();
+        let work = root.join("workspace");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut app = AppState::new_for_test(
+            8787,
+            work.to_string_lossy().to_string(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        app.transport = TransportKind::Local;
+        app.transport_url = None;
+        app.tailscale_owned = false;
+        app.funnel_binding = None;
+        app.mode = Mode::Computer;
+        app.tool_mode = ToolMode::ReadOnly;
+        app.sandbox_enabled = true;
+        app.handoff_enabled = false;
+        app.mcp_slug = "secret-slug".to_owned();
+        let shared = Arc::new(Mutex::new(app));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        shared.lock().await.port = addr.port();
+        let oauth = OAuthHttpState::new_local_acceptance(
+            OAuthSettings::new(ISSUER, RESOURCE).unwrap(),
+            OWNER,
+            addr.port(),
+        )
+        .unwrap();
+        let owner_ui = oauth.clone();
+        assert!(Arc::ptr_eq(&oauth.store, &owner_ui.store));
+        let token = issue_token(&owner_ui).await;
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let router = router_with_oauth_admission(
+            shared.clone(),
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            ui_tx,
+            Some(oauth.clone()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/secret-slug/mcp");
+        let unsigned = client.get(&url).send().await.unwrap();
+        assert_eq!(unsigned.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let signed = client.get(&url).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(signed.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        let spoofed = client
+            .get(&url)
+            .header(reqwest::header::HOST, "public.example")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spoofed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        // No OAuth acceptance session can be accidentally exposed when the
+        // app transport changes, or a stale Funnel binding appears.
+        shared.lock().await.transport = TransportKind::TailscaleFunnel;
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        shared.lock().await.transport = TransportKind::Local;
+        shared.lock().await.tailscale_owned = true;
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        shared.lock().await.tailscale_owned = false;
+        // Local owner emergency revocation propagates to the same HTTP state.
+        owner_ui.revoke_all_locally(OWNER).await.unwrap();
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

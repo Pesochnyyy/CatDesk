@@ -1860,6 +1860,18 @@ async fn run_transport_select(
 
 // ── Phase 1: Mode selection ─────────────────────────────────
 
+/// R8 opt-in must never take over an existing public or legacy transport.
+fn oauth_local_acceptance_ready(app: &AppState) -> bool {
+    app.transport == TransportKind::Local
+        && app.mode == Mode::Computer
+        && app.tool_mode.read_only()
+        && app.sandbox_enabled
+        && !app.handoff_enabled
+        && !app.tailscale_owned
+        && app.funnel_binding.is_none()
+        && app.transport_url.is_none()
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -1930,16 +1942,49 @@ async fn run_app(
         }
     }
 
-    // Start services
+    // R8 is a deliberately opt-in, single-process LOOPBACK acceptance.
+    // The same Arc-backed OAuth store is shared by local owner UI and HTTP.
+    // Public Funnel is never activated by this path.
+    let owner_oauth = if std::env::var("CATDESK_OAUTH_LOCAL_R8").ok().as_deref() == Some("1") {
+        let (allowed, mcp_path, previously_exposed, port) = {
+            let app = state.lock().await;
+            (
+                oauth_local_acceptance_ready(&app),
+                app.mcp_path(),
+                app.funnel_binding.is_some(),
+                app.port,
+            )
+        };
+        if !allowed {
+            return Err(std::io::Error::other(
+                "R8 requires Local transport, Computer mode, read-only tools, sandbox, no handoff, and no public route marker"
+            ).into());
+        }
+        transport::local_start_safe(previously_exposed)
+            .await
+            .map_err(std::io::Error::other)?;
+        let hostname = transport::original_tailnet_hostname()
+            .await
+            .map_err(std::io::Error::other)?;
+        let issuer = format!("https://{hostname}");
+        let oauth_settings = oauth::OAuthSettings::new(&issuer, &format!("{issuer}{mcp_path}"))
+            .map_err(|error| {
+                std::io::Error::other(format!("Invalid R8 OAuth identity: {error:?}"))
+            })?;
+        oauth_owner_tui::activate_loopback_session(terminal, oauth_settings, port).await?
+    } else {
+        None
+    };
+
+    // Start services, passing precisely the same cloneable OAuth state to
+    // the locally-bound HTTP router and the native approval panel.
     let (ui_event_tx, mut ui_event_rx) = unbounded_channel();
-    let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
+    let devtools_bridge = start_services(state.clone(), ui_event_tx, owner_oauth.clone()).await;
 
     run_chatgpt_connector_refresh_notice(terminal, state.clone(), &mut ui_event_rx).await?;
 
-    // Phase 2: main TUI loop
-    // The native owner UI is ready, but the production router has no OAuth
-    // session until authentication release gates have been accepted.
-    run_tui(terminal, state, devtools_bridge, ui_event_rx, None).await
+    // Phase 2: main TUI loop. No shared state exists without local opt-in.
+    run_tui(terminal, state, devtools_bridge, ui_event_rx, owner_oauth).await
 }
 
 async fn run_chatgpt_connector_refresh_notice(
@@ -5371,6 +5416,7 @@ async fn ensure_selected_browser_remote_debugging(
 async fn start_services(
     state: SharedState,
     ui_events: UnboundedSender<ServerUiEvent>,
+    owner_oauth: Option<oauth_http::OAuthHttpState>,
 ) -> Option<Arc<Mutex<DevtoolsBridge>>> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
@@ -5511,13 +5557,26 @@ async fn start_services(
         let app = state.lock().await;
         (app.mcp_path(), app.command_jobs.clone())
     };
-    let router = server::router(
-        state.clone(),
-        devtools_bridge.clone(),
-        command_jobs,
-        mcp_path,
-        ui_events,
-    );
+    // Acceptance sessions only ever bind a loopback listener. The normal
+    // branch retains all previous transport behavior without OAuth.
+    let router = if let Some(oauth) = owner_oauth.as_ref() {
+        server::router_with_oauth_admission(
+            state.clone(),
+            devtools_bridge.clone(),
+            command_jobs,
+            mcp_path,
+            ui_events,
+            Some(oauth.clone()),
+        )
+    } else {
+        server::router(
+            state.clone(),
+            devtools_bridge.clone(),
+            command_jobs,
+            mcp_path,
+            ui_events,
+        )
+    };
     // Fail closed when --bg Funnel may have survived a reboot, network failure,
     // crash, or transport choice change. Unknown status is NOT evidence of safety.
     if state.lock().await.transport != TransportKind::TailscaleFunnel {
@@ -6732,5 +6791,59 @@ fn draw_ui(
     // ── Floating toast (top-most layer) ──
     if let Some((msg, pos)) = toast {
         render_toast(f, palette, msg, pos);
+    }
+}
+#[cfg(test)]
+mod oauth_r8_boot_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn local_oauth_startup_rejects_every_unsafe_transport_configuration() {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("original-catdesk-r8-gate-{id}"));
+        std::fs::create_dir_all(&path).unwrap();
+        let mut app = AppState::new_for_test(
+            3899,
+            path.to_string_lossy().into_owned(),
+            path.join("config.toml"),
+        )
+        .unwrap();
+        app.transport = TransportKind::Local;
+        app.mode = Mode::Computer;
+        app.tool_mode = ToolMode::ReadOnly;
+        app.sandbox_enabled = true;
+        app.handoff_enabled = false;
+        app.tailscale_owned = false;
+        app.funnel_binding = None;
+        app.transport_url = None;
+        assert!(oauth_local_acceptance_ready(&app));
+
+        app.transport = TransportKind::TailscaleFunnel;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.transport = TransportKind::Ngrok;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.transport = TransportKind::Local;
+        app.mode = Mode::Both;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.mode = Mode::Computer;
+        app.tool_mode = ToolMode::MultiTools;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.tool_mode = ToolMode::ReadOnly;
+        app.sandbox_enabled = false;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.sandbox_enabled = true;
+        app.handoff_enabled = true;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.handoff_enabled = false;
+        app.tailscale_owned = true;
+        assert!(!oauth_local_acceptance_ready(&app));
+        app.tailscale_owned = false;
+        app.transport_url = Some("https://unexpected.ts.net".into());
+        assert!(!oauth_local_acceptance_ready(&app));
+        std::fs::remove_dir_all(&path).unwrap();
     }
 }

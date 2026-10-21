@@ -1,5 +1,6 @@
 //! Local terminal controls for the original CatDesk OAuth authorization flow.
 //! Never exposed as HTTP endpoints. No active session in production yet.
+use crate::oauth::OAuthSettings;
 use crate::oauth_http::{OAuthHttpState, PendingApproval};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -144,6 +145,30 @@ async fn read_secret_locally(terminal: &mut OwnerTerminal) -> OwnerResult<Option
         }
     }
 }
+/// Local-only, one-time opt-in. This does not start any network transport.
+/// The owner supplies an ephemeral 64-hex secret in the native terminal; it
+/// remains only in the process memory and is never persisted or logged.
+pub(crate) async fn activate_loopback_session(
+    terminal: &mut OwnerTerminal,
+    settings: OAuthSettings,
+    port: u16,
+) -> OwnerResult<Option<OAuthHttpState>> {
+    if !confirm(terminal,
+        "Enable LOCAL-ONLY OAuth acceptance for this one CatDesk process?\nPublic Funnel stays OFF. No ChatGPT remote access is enabled.\nUse a NEW 64-character hexadecimal owner key.",
+    ).await? {
+        return Ok(None);
+    }
+    let Some(mut key) = read_secret_locally(terminal).await? else {
+        return Ok(None);
+    };
+    let result = OAuthHttpState::new_local_acceptance(settings, &key, port);
+    key.zeroize();
+    match result {
+        Ok(session) => Ok(Some(session)),
+        Err(error) => Err(format!("Local OAuth setup rejected: {error:?}").into()),
+    }
+}
+
 pub(crate) async fn run_owner_panel(
     terminal: &mut OwnerTerminal,
     oauth: Option<&OAuthHttpState>,

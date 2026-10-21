@@ -96,6 +96,11 @@ fn value_array_contains(array: &Value, wanted: &str) -> bool {
 #[derive(Clone)]
 pub struct OAuthHttpState {
     pub settings: OAuthSettings,
+    /// When true this session is valid only on localhost, with Local
+    /// transport, and cannot follow a transition to Tailscale Funnel.
+    pub(crate) loopback_only: bool,
+    /// Fixed browser Origin for loopback acceptance (not a forwarded header).
+    pub(crate) loopback_origin: Option<String>,
     pub store: Arc<Mutex<OAuthStore>>,
     consent: Arc<Mutex<HashMap<String, PendingConsent>>>,
     limits: Arc<Mutex<OAuthLimits>>,
@@ -224,11 +229,35 @@ impl OAuthHttpState {
         let store = OAuthStore::new(settings.clone(), owner_key)?;
         Ok(Self {
             settings,
+            loopback_only: false,
+            loopback_origin: None,
             store: Arc::new(Mutex::new(store)),
             consent: Arc::new(Mutex::new(HashMap::new())),
             limits: Arc::new(Mutex::new(OAuthLimits::default())),
             verified_client_until: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// R8 controlled local acceptance: must never be used with public transport.
+    /// The same cloneable store must be passed to the local TUI and MCP router.
+    pub(crate) fn new_local_acceptance(
+        settings: OAuthSettings,
+        owner_key: &str,
+        port: u16,
+    ) -> Result<Self, OAuthError> {
+        if port == 0 {
+            return Err(OAuthError::InvalidConfiguration);
+        }
+        let mut state = Self::new(settings, owner_key)?;
+        state.loopback_only = true;
+        state.loopback_origin = Some(format!("http://localhost:{port}"));
+        Ok(state)
+    }
+
+    pub(crate) fn approval_origin(&self) -> &str {
+        self.loopback_origin
+            .as_deref()
+            .unwrap_or(&self.settings.issuer)
     }
 
     fn client_is_verified(&self) -> bool {
@@ -552,7 +581,7 @@ fn origin_valid(headers: &HeaderMap, issuer: &str) -> bool {
 async fn approve(State(state): State<OAuthHttpState>, headers: HeaderMap, body: Bytes) -> Response {
     // Browser forms always provide an Origin in modern browsers; no silent
     // fallback to Host/X-Forwarded-Host which a proxy client could forge.
-    if !origin_valid(&headers, &state.settings.issuer) {
+    if !origin_valid(&headers, state.approval_origin()) {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     }
     // The public/browser endpoint NEVER receives or verifies owner keys.
@@ -1058,6 +1087,25 @@ mod tests {
         );
         let replay = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn r8_local_browser_origin_is_exact_and_only_works_in_loopback_mode() {
+        let settings = OAuthSettings::new(ISSUER, RESOURCE).unwrap();
+        assert!(OAuthHttpState::new_local_acceptance(settings.clone(), OWNER, 0).is_err());
+        let state = OAuthHttpState::new_local_acceptance(settings, OWNER, 3200).unwrap();
+        assert!(state.verify_document_for_test(&valid_client_document()));
+        assert_eq!(state.approval_origin(), "http://localhost:3200");
+        let router = preview_router(state.clone());
+        let (cookie, id) = prepare_consent(&router).await;
+        state.approve_locally(&id, OWNER).await.unwrap();
+        let wrong = send_approval(&router, &cookie, &id, ISSUER).await;
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+        let wrong_port = send_approval(&router, &cookie, &id, "http://localhost:3201").await;
+        assert_eq!(wrong_port.status(), StatusCode::FORBIDDEN);
+        let correct = send_approval(&router, &cookie, &id, "http://localhost:3200").await;
+        assert_eq!(correct.status(), StatusCode::SEE_OTHER);
+        assert_eq!(test_state().approval_origin(), ISSUER);
     }
 
     #[tokio::test]

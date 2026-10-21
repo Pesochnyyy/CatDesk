@@ -90,11 +90,25 @@ pub async fn guard(
         .unwrap_or("");
     let local = loopback_host(host, port);
     let funnel_guard = funnel_auth_required(kind, owned, pending_route);
-    if admission.oauth.is_some() && !funnel_guard {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    // R8 acceptance is *strictly loopback-only*. It must fail closed on
+    // transport changes, stale Funnel ownership, or a non-loopback Host.
+    // An ordinary OAuth instance cannot downgrade to unauthenticated Local.
+    let loopback_oauth = admission
+        .oauth
+        .as_ref()
+        .is_some_and(|oauth| oauth.loopback_only)
+        && kind == TransportKind::Local
+        && !owned
+        && !pending_route
+        && local
+        && base_url.is_none();
+    if let Some(oauth) = &admission.oauth {
+        if (oauth.loopback_only && !loopback_oauth) || (!oauth.loopback_only && !funnel_guard) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
 
-    if funnel_guard {
+    if funnel_guard || loopback_oauth {
         // While OAuth and widget-scoped authorization are unavailable, expose
         // ONLY the MCP route and health probe; block all widget POST endpoints.
         if !read_only || !safe_mode {
@@ -121,16 +135,15 @@ pub async fn guard(
                 return StatusCode::MISDIRECTED_REQUEST.into_response();
             }
             if p == "/authorize/approve" {
-                let issuer = &admission
+                let expected_origin = admission
                     .oauth
                     .as_ref()
                     .expect("OAuth route")
-                    .settings
-                    .issuer;
+                    .approval_origin();
                 if headers
                     .get(header::ORIGIN)
                     .and_then(|value| value.to_str().ok())
-                    != Some(issuer.as_str())
+                    != Some(expected_origin)
                 {
                     return StatusCode::FORBIDDEN.into_response();
                 }

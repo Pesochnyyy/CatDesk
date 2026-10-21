@@ -71,6 +71,15 @@ fn original_tailscale_command() -> Result<Command, String> {
     Ok(command)
 }
 
+/// Read-only identity lookup from the original CatDesk's isolated socket.
+/// Never consult the system Tailscale daemon or another CatDesk instance.
+pub async fn original_tailnet_hostname() -> Result<String, String> {
+    let raw = tailscale(&["status", "--json"]).await?;
+    let status: Value = serde_json::from_str(&raw)
+        .map_err(|_| "Invalid isolated Tailscale status JSON".to_string())?;
+    public_hostname(&status)
+}
+
 async fn tailscale(args: &[&str]) -> Result<String, String> {
     let mut command = original_tailscale_command()?;
     let output = tokio::time::timeout(
