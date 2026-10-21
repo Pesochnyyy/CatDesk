@@ -73,7 +73,23 @@ pub fn router(
     mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,
 ) -> Router {
-    let auth_state = app_state.clone();
+    router_with_oauth_admission(app_state, devtools, command_jobs, mcp_path, ui_events, None)
+}
+
+/// A test-injectable OAuth admission path. The production entry point always
+/// passes None; this cannot expose incomplete OAuth endpoints or tokens.
+fn router_with_oauth_admission(
+    app_state: SharedState,
+    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    command_jobs: CommandJobManager,
+    mcp_path: String,
+    ui_events: UnboundedSender<ServerUiEvent>,
+    oauth_admission: Option<crate::oauth_http::OAuthHttpState>,
+) -> Router {
+    let auth_state = security::AdmissionState {
+        app: app_state.clone(),
+        oauth: oauth_admission,
+    };
     let state = ServerState {
         app: app_state,
         devtools,
@@ -3247,4 +3263,220 @@ async fn delete_mcp(State(s): State<ServerState>) -> Response<Body> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"status":"ok"}"#))
         .unwrap()
+}
+#[cfg(test)]
+mod oauth_mcp_admission_tests {
+    use super::*;
+    use crate::oauth::{AuthorizationRequest, OAuthSettings, TokenRequest};
+    use crate::oauth_http::OAuthHttpState;
+    use crate::state::{AppState, Mode, ToolMode};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    const OWNER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ISSUER: &str = "https://catdesk-original-mac.tailb0b5b7.ts.net";
+    const RESOURCE: &str = "https://catdesk-original-mac.tailb0b5b7.ts.net/secret-slug/mcp";
+    const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    async fn issue_token(oauth: &OAuthHttpState) -> String {
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let authorization = AuthorizationRequest {
+            response_type: "code".into(),
+            client_id: "https://chatgpt.com/oauth/client.json".into(),
+            redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect".into(),
+            resource: RESOURCE.into(),
+            scope: "catdesk:read".into(),
+            state: "unpredictable-random-client-state-1234".into(),
+            code_challenge: challenge,
+            code_challenge_method: "S256".into(),
+        };
+        let mut store = oauth.store.lock().await;
+        let redirect = store
+            .issue_code_after_owner_approval(authorization, OWNER)
+            .unwrap();
+        let callback = reqwest::Url::parse(&redirect).unwrap();
+        let code = callback
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .to_string();
+        store
+            .exchange(TokenRequest {
+                grant_type: "authorization_code",
+                code: &code,
+                code_verifier: VERIFIER,
+                client_id: "https://chatgpt.com/oauth/client.json",
+                redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+                resource: RESOURCE,
+            })
+            .unwrap()
+            .access_token
+    }
+
+    #[tokio::test]
+    async fn real_mcp_route_enforces_oauth_without_bearer_downgrade() {
+        let root = temp_path("original-catdesk-oauth-mcp");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let work = root.join("workspace");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut app =
+            AppState::new_for_test(8787, work.to_string_lossy().to_string(), config.clone())
+                .unwrap();
+        app.transport = TransportKind::TailscaleFunnel;
+        app.mode = Mode::Computer;
+        app.tool_mode = ToolMode::ReadOnly;
+        app.sandbox_enabled = true;
+        app.handoff_enabled = false;
+        app.mcp_slug = "secret-slug".to_owned();
+
+        let app_state = Arc::new(Mutex::new(app));
+        let oauth =
+            OAuthHttpState::new(OAuthSettings::new(ISSUER, RESOURCE).unwrap(), OWNER).unwrap();
+        let token = issue_token(&oauth).await;
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        app_state.lock().await.port = addr.port();
+        let router = router_with_oauth_admission(
+            app_state.clone(),
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            ui_tx,
+            Some(oauth.clone()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{addr}/secret-slug/mcp");
+
+        let no_token = client.get(&endpoint).send().await.unwrap();
+        assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let challenge = no_token.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap();
+        assert!(challenge.contains("resource_metadata="));
+        assert!(challenge.contains("catdesk:read"));
+
+        let bad = client
+            .get(&endpoint)
+            .bearer_auth("invalid")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let valid = client
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+        // The OAuth read-only token must not grant unrelated widget endpoints.
+        let widget = client
+            .get(format!("http://{addr}/secret-slug/agents/path-state"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(widget.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // A real MCP POST, not a synthetic auth-only route.
+        let payload = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        });
+        let response = client
+            .post(&endpoint)
+            .json(&payload)
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(result["jsonrpc"], "2.0");
+        assert!(result.get("result").is_some());
+        let tools = result["result"]["tools"].as_array().unwrap();
+        for item in tools {
+            assert!(!matches!(
+                item["name"].as_str(),
+                Some("run_command" | "write" | "edit" | "delete" | "start_command")
+            ));
+        }
+
+        // A valid read-only OAuth token must never execute a command tool.
+        let dangerous = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "run_command",
+                "arguments": {"command": "touch /tmp/SHOULD_NOT_EXIST"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let denied = client
+            .post(&endpoint)
+            .json(&dangerous)
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "run_command")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // A live mode change must deny even previously valid tokens.
+        app_state.lock().await.tool_mode = ToolMode::MultiTools;
+        let unsafe_mode = client
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unsafe_mode.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        app_state.lock().await.tool_mode = ToolMode::ReadOnly;
+
+        // Revocation is respected on the next *real* MCP request.
+        assert!(oauth.store.lock().await.revoke(&token));
+        let revoked = client
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

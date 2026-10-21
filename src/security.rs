@@ -1,7 +1,18 @@
 //! Request admission for original CatDesk. Must wrap ALL HTTP routes.
 //! Host/Origin never authenticate a request. Remote Funnel always requires a token,
 //! including when the public proxy forwards with a forged loopback Host header.
+use crate::oauth_http::OAuthHttpState;
 use crate::state::{SharedState, TransportKind};
+
+/// OAuth is an explicit admission mode. The live server passes `None` until
+/// browser consent and end-to-end client registration pass release review.
+/// Never fall back from an invalid OAuth token to the legacy lab bearer.
+#[derive(Clone)]
+pub struct AdmissionState {
+    pub app: SharedState,
+    pub oauth: Option<OAuthHttpState>,
+}
+
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, Method, StatusCode, header},
@@ -50,7 +61,12 @@ fn origin_allowed(headers: &HeaderMap, allow_chatgpt: bool) -> bool {
 /// 'local' or 'ngrok'. The lifecycle manager refuses that transition too.
 /// This defense in depth rejects unexpected HTTP hosts even if a previous
 /// background Funnel has been left configured or the configuration was edited.
-pub async fn guard(State(app): State<SharedState>, request: Request, next: Next) -> Response {
+pub async fn guard(
+    State(admission): State<AdmissionState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let app = &admission.app;
     let (kind, base_url, legacy_url, owned, pending_route, port, slug, read_only, safe_mode) = {
         let state = app.lock().await;
         (
@@ -92,20 +108,53 @@ pub async fn guard(State(app): State<SharedState>, request: Request, next: Next)
         if !health_ok && !mcp_ok {
             return StatusCode::FORBIDDEN.into_response();
         }
-        let expected = std::env::var("CATDESK_MCP_BEARER_TOKEN").unwrap_or_default();
-        if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
         let supplied = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "));
-        if !supplied.is_some_and(|value| token_eq(&expected, value)) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-            )
-                .into_response();
+        if let Some(oauth) = &admission.oauth {
+            // Exact resource + read scope, checked for every HTTP request.
+            // This option is not enabled by the production entry point yet.
+            let authorized = if let Some(token) = supplied {
+                oauth
+                    .store
+                    .lock()
+                    .await
+                    .validate_token(token, &oauth.settings.resource, "catdesk:read")
+                    .is_ok()
+            } else {
+                false
+            };
+            if !authorized {
+                let path = reqwest::Url::parse(&oauth.settings.resource)
+                    .expect("validated resource URL")
+                    .path()
+                    .to_string();
+                let metadata = format!(
+                    "{}/.well-known/oauth-protected-resource{}",
+                    oauth.settings.issuer, path
+                );
+                let challenge = format!(
+                    "Bearer realm=\"mcp\", resource_metadata=\"{metadata}\", scope=\"catdesk:read\""
+                );
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, challenge)],
+                )
+                    .into_response();
+            }
+        } else {
+            let expected = std::env::var("CATDESK_MCP_BEARER_TOKEN").unwrap_or_default();
+            if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if !supplied.is_some_and(|value| token_eq(&expected, value)) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                )
+                    .into_response();
+            }
         }
         // No X-Forwarded-Host / Forwarded trust. Public Host comes from Tailscale.
         if !local && url_host(base_url.as_deref()) != Some(host) {
