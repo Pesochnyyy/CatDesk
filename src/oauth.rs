@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const CLIENT_ID: &str = "https://chatgpt.com/oauth/client.json";
-const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+pub const CLIENT_ID: &str = "https://chatgpt.com/oauth/client.json";
+pub const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
 const READ_SCOPE: &str = "catdesk:read";
 const CODE_TTL: Duration = Duration::from_secs(120);
 const ACCESS_TTL: Duration = Duration::from_secs(900);
@@ -90,9 +90,10 @@ impl OAuthSettings {
             "token_endpoint_auth_methods_supported": ["none"],
             "authorization_response_iss_parameter_supported": true,
             "scopes_supported": [READ_SCOPE],
-            // A single explicitly pre-registered client; no unverified
-            // URL fetching and no unsafe open dynamic registration.
-            "client_id_metadata_document_supported": false
+            // R4 HTTP preview validates the pinned ChatGPT CIMD document
+            // over HTTPS before any browser authorization. The real server
+            // does NOT mount these endpoints yet.
+            "client_id_metadata_document_supported": true
         })
     }
 }

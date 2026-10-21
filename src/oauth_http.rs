@@ -4,7 +4,10 @@
 //! until client registration, consent and token admission have passed security review.
 #![allow(dead_code)]
 
-use crate::oauth::{AuthorizationRequest, OAuthError, OAuthSettings, OAuthStore, TokenRequest};
+use crate::oauth::{
+    AuthorizationRequest, CHATGPT_CALLBACK, CLIENT_ID, OAuthError, OAuthSettings, OAuthStore,
+    TokenRequest,
+};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -18,8 +21,8 @@ use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -29,12 +32,70 @@ const MAX_CONSENT: usize = 64;
 const MAX_FORM_BYTES: usize = 8192;
 const COOKIE_NAME: &str = "__Host-catdesk-oauth-consent";
 const CONSENT_COOKIE: &str = "__Host-catdesk-oauth-consent";
+const CLIENT_METADATA_MAX_BYTES: usize = 16 * 1024;
+const CLIENT_METADATA_TTL: Duration = Duration::from_secs(300);
+const APPROVAL_WINDOW: Duration = Duration::from_secs(600);
+const APPROVAL_MAX: usize = 5;
+const AUTHORIZE_WINDOW: Duration = Duration::from_secs(60);
+const AUTHORIZE_MAX: usize = 24;
+const TOKEN_WINDOW: Duration = Duration::from_secs(60);
+const TOKEN_MAX: usize = 32;
+
+#[derive(Default)]
+struct RateWindow {
+    hits: VecDeque<Instant>,
+}
+
+impl RateWindow {
+    fn check(&mut self, now: Instant, window: Duration, maximum: usize) -> Result<(), u64> {
+        while self
+            .hits
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= window)
+        {
+            self.hits.pop_front();
+        }
+        if self.hits.len() >= maximum {
+            let remaining = window.saturating_sub(now.duration_since(*self.hits.front().unwrap()));
+            return Err(remaining.as_secs().max(1));
+        }
+        self.hits.push_back(now);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct OAuthLimits {
+    authorize: RateWindow,
+    approve: RateWindow,
+    token: RateWindow,
+}
+
+/// The only supported client_id is this exact fixed ChatGPT HTTPS document.
+/// Never fetch an untrusted client-provided URL (SSRF defense).
+fn chatgpt_client_metadata_valid(value: &Value) -> bool {
+    let has = |field: &str, candidate: &str| value_array_contains(&value[field], candidate);
+    value["client_id"].as_str() == Some(CLIENT_ID)
+        && has("redirect_uris", CHATGPT_CALLBACK)
+        && has("grant_types", "authorization_code")
+        && has("response_types", "code")
+        && (has("token_endpoint_auth_methods_supported", "none")
+            || value["token_endpoint_auth_method"].as_str() == Some("none"))
+}
+
+fn value_array_contains(array: &Value, wanted: &str) -> bool {
+    array
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(wanted)))
+}
 
 #[derive(Clone)]
 pub struct OAuthHttpState {
     pub settings: OAuthSettings,
     pub store: Arc<Mutex<OAuthStore>>,
     consent: Arc<Mutex<HashMap<String, PendingConsent>>>,
+    limits: Arc<Mutex<OAuthLimits>>,
+    verified_client_until: Arc<StdMutex<Option<Instant>>>,
 }
 
 struct PendingConsent {
@@ -73,6 +134,18 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 
 fn failure(status: StatusCode, code: &str) -> Response {
     json_response(status, json!({"error":code}))
+}
+
+fn slow_down(retry_after: u64) -> Response {
+    let mut response = failure(StatusCode::TOO_MANY_REQUESTS, "slow_down");
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        retry_after
+            .to_string()
+            .parse()
+            .expect("retry-after seconds"),
+    );
+    response
 }
 
 fn parse_pairs(data: &str, expected: &[&str]) -> Result<HashMap<String, String>, OAuthError> {
@@ -139,7 +212,70 @@ impl OAuthHttpState {
             settings,
             store: Arc::new(Mutex::new(store)),
             consent: Arc::new(Mutex::new(HashMap::new())),
+            limits: Arc::new(Mutex::new(OAuthLimits::default())),
+            verified_client_until: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    fn client_is_verified(&self) -> bool {
+        self.verified_client_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// No arbitrary outbound URLs: only the literal pinned ChatGPT CIMD URL.
+    /// Never follow redirects or accept an oversized response. A network
+    /// failure means no new owner authorization (fail closed).
+    async fn verify_pinned_chatgpt_client(&self) -> bool {
+        if self.client_is_verified() {
+            return true;
+        }
+        let Ok(client) = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(8))
+            .build()
+        else {
+            return false;
+        };
+        let Ok(mut response) = client
+            .get(CLIENT_ID)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if response.status() != reqwest::StatusCode::OK || response.url().as_str() != CLIENT_ID {
+            return false;
+        }
+        let mut contents = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if contents.len() + chunk.len() <= CLIENT_METADATA_MAX_BYTES => {
+                    contents.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                _ => return false,
+            }
+        }
+        let Ok(document) = serde_json::from_slice::<Value>(&contents) else {
+            return false;
+        };
+        if !chatgpt_client_metadata_valid(&document) {
+            return false;
+        }
+        *self.verified_client_until.lock().unwrap() = Some(Instant::now() + CLIENT_METADATA_TTL);
+        true
+    }
+
+    #[cfg(test)]
+    fn verify_document_for_test(&self, document: &Value) -> bool {
+        if !chatgpt_client_metadata_valid(document) {
+            return false;
+        }
+        *self.verified_client_until.lock().unwrap() = Some(Instant::now() + CLIENT_METADATA_TTL);
+        true
     }
 }
 
@@ -180,6 +316,16 @@ async fn authorization_form(
     State(state): State<OAuthHttpState>,
     RawQuery(query): RawQuery,
 ) -> Response {
+    let throttle =
+        state
+            .limits
+            .lock()
+            .await
+            .authorize
+            .check(Instant::now(), AUTHORIZE_WINDOW, AUTHORIZE_MAX);
+    if let Err(seconds) = throttle {
+        return slow_down(seconds);
+    }
     let Some(query) = query else {
         return failure(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -196,6 +342,11 @@ async fn authorization_form(
         .is_err()
     {
         return failure(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    // Before creating any browser session, validate ChatGPT's real metadata
+    // from the pinned HTTPS URL, not a user-supplied client_id URL.
+    if !state.verify_pinned_chatgpt_client().await {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
     let request_id = random_nonce();
     let csrf = random_nonce();
@@ -282,6 +433,19 @@ async fn approve(State(state): State<OAuthHttpState>, headers: HeaderMap, body: 
     let Some(cookie) = cookie_value(&headers) else {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     };
+    let throttle =
+        state
+            .limits
+            .lock()
+            .await
+            .approve
+            .check(Instant::now(), APPROVAL_WINDOW, APPROVAL_MAX);
+    if let Err(seconds) = throttle {
+        return slow_down(seconds);
+    }
+    if !state.client_is_verified() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+    }
     // Consume the consent request regardless of owner key outcome.
     // Replays, stale browser tabs and brute-force retries cannot reuse it.
     let mut consent = state.consent.lock().await;
@@ -354,6 +518,15 @@ async fn preview_protected(State(state): State<OAuthHttpState>, headers: HeaderM
 }
 
 async fn token(State(state): State<OAuthHttpState>, headers: HeaderMap, body: Bytes) -> Response {
+    let throttle = state
+        .limits
+        .lock()
+        .await
+        .token
+        .check(Instant::now(), TOKEN_WINDOW, TOKEN_MAX);
+    if let Err(seconds) = throttle {
+        return slow_down(seconds);
+    }
     let form = match form_body(&headers, &body).and_then(|body| {
         parse_pairs(
             &body,
@@ -409,7 +582,21 @@ mod tests {
     const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
 
     fn test_state() -> OAuthHttpState {
-        OAuthHttpState::new(OAuthSettings::new(ISSUER, RESOURCE).unwrap(), OWNER).unwrap()
+        let state =
+            OAuthHttpState::new(OAuthSettings::new(ISSUER, RESOURCE).unwrap(), OWNER).unwrap();
+        assert!(state.verify_document_for_test(&valid_client_document()));
+        state
+    }
+
+    fn valid_client_document() -> Value {
+        json!({
+            "client_id": CLIENT,
+            "redirect_uris": [CALLBACK],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"]
+        })
     }
 
     fn encode(fields: &[(&str, &str)]) -> String {
@@ -700,6 +887,95 @@ mod tests {
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
         let replay = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
         assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn fixed_client_metadata_rejects_untrusted_or_incomplete_documents() {
+        let mut doc = valid_client_document();
+        assert!(chatgpt_client_metadata_valid(&doc));
+        doc["client_id"] = json!("https://attacker.example/oauth/client.json");
+        assert!(!chatgpt_client_metadata_valid(&doc));
+        let mut doc = valid_client_document();
+        doc["redirect_uris"] = json!(["https://attacker.example/callback"]);
+        assert!(!chatgpt_client_metadata_valid(&doc));
+        let mut doc = valid_client_document();
+        doc["token_endpoint_auth_methods_supported"] = json!(["private_key_jwt"]);
+        assert!(!chatgpt_client_metadata_valid(&doc));
+        let mut doc = valid_client_document();
+        doc["grant_types"] = json!(["client_credentials"]);
+        assert!(!chatgpt_client_metadata_valid(&doc));
+        let state =
+            OAuthHttpState::new(OAuthSettings::new(ISSUER, RESOURCE).unwrap(), OWNER).unwrap();
+        assert!(!state.client_is_verified());
+        assert!(!state.verify_document_for_test(&json!({"client_id": CLIENT})));
+        assert!(!state.client_is_verified());
+        assert!(state.verify_document_for_test(&valid_client_document()));
+        assert!(state.client_is_verified());
+        *state.verified_client_until.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(!state.client_is_verified());
+    }
+
+    /// Explicit network acceptance, intentionally excluded from offline CI.
+    /// Uses the fixed HTTPS client metadata URL, never user-controlled input.
+    #[tokio::test]
+    #[ignore = "requires external HTTPS access to chatgpt.com"]
+    async fn live_chatgpt_client_metadata_is_verified_over_https() {
+        let state =
+            OAuthHttpState::new(OAuthSettings::new(ISSUER, RESOURCE).unwrap(), OWNER).unwrap();
+        assert!(!state.client_is_verified());
+        assert!(state.verify_pinned_chatgpt_client().await);
+        assert!(state.client_is_verified());
+    }
+
+    #[test]
+    fn sliding_window_recovers_after_expiry() {
+        let mut limiter = RateWindow::default();
+        let now = Instant::now();
+        assert_eq!(limiter.check(now, Duration::from_secs(60), 2), Ok(()));
+        assert_eq!(limiter.check(now, Duration::from_secs(60), 2), Ok(()));
+        assert_eq!(limiter.check(now, Duration::from_secs(60), 2), Err(60));
+        assert_eq!(
+            limiter.check(now + Duration::from_secs(61), Duration::from_secs(60), 2),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_and_token_rate_limits_return_retry_after() {
+        let router = preview_router(test_state());
+        for _ in 0..AUTHORIZE_MAX {
+            assert_eq!(
+                call(&router, request("GET", &authorize_url()))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let limited = call(&router, request("GET", &authorize_url())).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+        for _ in 0..TOKEN_MAX {
+            let invalid = call(&router, token_request("never-issued", VERIFIER, RESOURCE)).await;
+            assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        }
+        let limited = call(&router, token_request("never-issued", VERIFIER, RESOURCE)).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn owner_approval_rate_limit_is_global_and_fails_closed() {
+        let router = preview_router(test_state());
+        for _ in 0..APPROVAL_MAX {
+            let (cookie, id) = prepare_consent(&router).await;
+            let response = send_approval(&router, &cookie, &id, "wrong", ISSUER).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let (cookie, id) = prepare_consent(&router).await;
+        let limited = send_approval(&router, &cookie, &id, OWNER, ISSUER).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
     }
 
     #[tokio::test]
