@@ -36,6 +36,8 @@ const CLIENT_METADATA_MAX_BYTES: usize = 16 * 1024;
 const CLIENT_METADATA_TTL: Duration = Duration::from_secs(300);
 const APPROVAL_WINDOW: Duration = Duration::from_secs(600);
 const APPROVAL_MAX: usize = 5;
+const COMPLETE_WINDOW: Duration = Duration::from_secs(60);
+const COMPLETE_MAX: usize = 32;
 const AUTHORIZE_WINDOW: Duration = Duration::from_secs(60);
 const AUTHORIZE_MAX: usize = 24;
 const TOKEN_WINDOW: Duration = Duration::from_secs(60);
@@ -68,6 +70,7 @@ impl RateWindow {
 struct OAuthLimits {
     authorize: RateWindow,
     approve: RateWindow,
+    complete: RateWindow,
     token: RateWindow,
 }
 
@@ -99,9 +102,19 @@ pub struct OAuthHttpState {
 }
 
 struct PendingConsent {
-    auth: AuthorizationRequest,
+    auth: Option<AuthorizationRequest>,
     csrf_digest: [u8; 32],
     expires_at: Instant,
+    approved_redirect: Option<String>,
+}
+
+/// Safe local-TUI projection: no owner key, verifier, CSRF secret or OAuth code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingApproval {
+    pub request_id: String,
+    pub client_id: String,
+    pub resource: String,
+    pub scope: String,
 }
 
 fn digest(value: &str) -> [u8; 32] {
@@ -269,6 +282,83 @@ impl OAuthHttpState {
         true
     }
 
+    /// Explicit *local application* approval. Never expose this method as a
+    /// network handler. A future TUI control can invoke it only after the
+    /// owner has inspected the pending request and confirmed consent.
+    pub(crate) async fn approve_locally(
+        &self,
+        request_id: &str,
+        owner_key: &str,
+    ) -> Result<(), OAuthError> {
+        if !self.client_is_verified() {
+            return Err(OAuthError::Unauthorized);
+        }
+        let throttle =
+            self.limits
+                .lock()
+                .await
+                .approve
+                .check(Instant::now(), APPROVAL_WINDOW, APPROVAL_MAX);
+        if throttle.is_err() {
+            return Err(OAuthError::CapacityExceeded);
+        }
+        // A local approval consumes its pending request, including when the
+        // owner key is wrong. Repeated key guesses cannot reuse one request.
+        // Hold consent across code issuance to serialize against revoke-all.
+        let mut consent = self.consent.lock().await;
+        let pending = consent
+            .remove(request_id)
+            .ok_or(OAuthError::InvalidRequest)?;
+        if pending.expires_at <= Instant::now() || pending.approved_redirect.is_some() {
+            return Err(OAuthError::InvalidRequest);
+        }
+        let redirect = self.store.lock().await.issue_code_after_owner_approval(
+            pending.auth.ok_or(OAuthError::InvalidRequest)?,
+            owner_key,
+        )?;
+        consent.insert(
+            request_id.to_owned(),
+            PendingConsent {
+                auth: None,
+                csrf_digest: pending.csrf_digest,
+                expires_at: pending.expires_at,
+                approved_redirect: Some(redirect),
+            },
+        );
+        Ok(())
+    }
+
+    /// Local-only pending approval list, for a future TUI review panel.
+    pub(crate) async fn pending_requests_locally(&self) -> Vec<PendingApproval> {
+        let mut consent = self.consent.lock().await;
+        consent.retain(|_, pending| pending.expires_at > Instant::now());
+        let mut approvals: Vec<_> = consent
+            .iter()
+            .filter_map(|(id, pending)| {
+                let auth = pending.auth.as_ref()?;
+                Some(PendingApproval {
+                    request_id: id.clone(),
+                    client_id: auth.client_id.clone(),
+                    resource: auth.resource.clone(),
+                    scope: auth.scope.clone(),
+                })
+            })
+            .collect();
+        approvals.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        approvals
+    }
+
+    /// Owner-only emergency revocation; never mount as an HTTP endpoint.
+    pub(crate) async fn revoke_all_locally(&self, owner_key: &str) -> Result<(), OAuthError> {
+        let mut consent = self.consent.lock().await;
+        self.store
+            .lock()
+            .await
+            .revoke_all_after_owner_approval(owner_key)?;
+        consent.clear();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn verify_document_for_test(&self, document: &Value) -> bool {
         if !chatgpt_client_metadata_valid(document) {
@@ -384,9 +474,10 @@ async fn authorization_form(
     consent.insert(
         request_id.clone(),
         PendingConsent {
-            auth: request,
+            auth: Some(request),
             csrf_digest: digest(&csrf),
             expires_at: Instant::now() + CONSENT_TTL,
+            approved_redirect: None,
         },
     );
     drop(consent);
@@ -398,12 +489,13 @@ async fn authorization_form(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Original CatDesk: authorize read-only access</title></head>
 <body><main><h1>Approve original CatDesk read-only access</h1>
-<p>Only the owner may approve a short-lived read-only session.
-This is a DEVELOPMENT PREVIEW and cannot be used from ChatGPT yet.</p>
+<p>This request must be approved locally in the original CatDesk app.
+Do not enter your owner secret into any website. This development preview
+has no public owner approval interface.</p>
+<p>Request identifier: <code>{request_id}</code></p>
 <form action="/authorize/approve" method="post">
 <input type="hidden" name="request_id" value="{request_id}">
-<label>Owner approval key (64 hex characters) <input type="password" name="owner_key" autocomplete="off" minlength="64" maxlength="64" required></label>
-<button type="submit">Approve read-only access</button>
+<button type="submit">Continue after local approval</button>
 </form></main></body></html>"#
     );
     let mut response = Html(html).into_response();
@@ -450,8 +542,8 @@ async fn approve(State(state): State<OAuthHttpState>, headers: HeaderMap, body: 
     if !origin_valid(&headers, &state.settings.issuer) {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     }
-    let form = match form_body(&headers, &body)
-        .and_then(|body| parse_pairs(&body, &["request_id", "owner_key"]))
+    // The public/browser endpoint NEVER receives or verifies owner keys.
+    let form = match form_body(&headers, &body).and_then(|body| parse_pairs(&body, &["request_id"]))
     {
         Ok(form) => form,
         Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -464,35 +556,31 @@ async fn approve(State(state): State<OAuthHttpState>, headers: HeaderMap, body: 
             .limits
             .lock()
             .await
-            .approve
-            .check(Instant::now(), APPROVAL_WINDOW, APPROVAL_MAX);
+            .complete
+            .check(Instant::now(), COMPLETE_WINDOW, COMPLETE_MAX);
     if let Err(seconds) = throttle {
         return slow_down(seconds);
     }
     if !state.client_is_verified() {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
-    // Consume the consent request regardless of owner key outcome.
-    // Replays, stale browser tabs and brute-force retries cannot reuse it.
+    // A public request cannot create consent. Only a local, successful
+    // approve_locally action can populate approved_redirect. Keep pending
+    // records on bad cookies or before approval to prevent remote DoS.
     let mut consent = state.consent.lock().await;
-    let pending = consent.remove(&form["request_id"]);
-    drop(consent);
-    let Some(pending) = pending else {
+    let request_id = &form["request_id"];
+    let Some(pending) = consent.get(request_id) else {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     };
     if Instant::now() >= pending.expires_at || !eq_32(&pending.csrf_digest, &digest(&cookie)) {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     }
-
-    let redirect = match state
-        .store
-        .lock()
-        .await
-        .issue_code_after_owner_approval(pending.auth, &form["owner_key"])
-    {
-        Ok(url) => url,
-        Err(_) => return failure(StatusCode::FORBIDDEN, "access_denied"),
+    let Some(redirect) = pending.approved_redirect.as_ref() else {
+        return failure(StatusCode::FORBIDDEN, "authorization_pending");
     };
+    let redirect = redirect.clone();
+    consent.remove(request_id);
+    drop(consent);
     let mut response = (StatusCode::SEE_OTHER, "").into_response();
     base_headers(&mut response);
     response
@@ -702,10 +790,9 @@ mod tests {
         router: &Router,
         cookie: &str,
         request_id: &str,
-        owner_key: &str,
         origin: &str,
     ) -> Response {
-        let body = encode(&[("request_id", request_id), ("owner_key", owner_key)]);
+        let body = encode(&[("request_id", request_id)]);
         let req = Request::builder()
             .method("POST")
             .uri("/authorize/approve")
@@ -838,7 +925,8 @@ mod tests {
         assert!(header.contains("resource_metadata=\"https://catdesk-original-mac.tailb0b5b7.ts.net/.well-known/oauth-protected-resource/example-secret/mcp\""));
         assert!(header.contains("scope=\"catdesk:read\""));
         let (cookie, request_id) = prepare_consent(&router).await;
-        let approved = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
+        state.approve_locally(&request_id, OWNER).await.unwrap();
+        let approved = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(approved.status(), StatusCode::SEE_OTHER);
         assert_eq!(approved.headers()[header::CACHE_CONTROL], "no-store");
         let redirect = approved.headers()[header::LOCATION].to_str().unwrap();
@@ -858,7 +946,7 @@ mod tests {
             .1
             .to_string();
 
-        let again = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
+        let again = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(again.status(), StatusCode::FORBIDDEN);
         let bad = call(
             &router,
@@ -871,7 +959,8 @@ mod tests {
 
         // New request exchanges successfully, token is audience- and scope-bound.
         let (cookie, request_id) = prepare_consent(&router).await;
-        let approved = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
+        state.approve_locally(&request_id, OWNER).await.unwrap();
+        let approved = send_approval(&router, &cookie, &request_id, ISSUER).await;
         let location = approved.headers()[header::LOCATION].to_str().unwrap();
         let code = reqwest::Url::parse(location)
             .unwrap()
@@ -926,26 +1015,118 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_missing_or_wrong_origin_prevents_approval() {
-        let router = preview_router(test_state());
+        let state = test_state();
+        let router = preview_router(state.clone());
         let (cookie, request_id) = prepare_consent(&router).await;
-        let response =
-            send_approval(&router, &cookie, &request_id, OWNER, "https://evil.example").await;
+        state.approve_locally(&request_id, OWNER).await.unwrap();
+        let response = send_approval(&router, &cookie, &request_id, "https://evil.example").await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let response = send_approval(&router, "missing=1", &request_id, OWNER, ISSUER).await;
+        let response = send_approval(&router, "missing=1", &request_id, ISSUER).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         // Missing cookie does not consume the pending request.
-        let response = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
+        let response = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
     }
 
     #[tokio::test]
     async fn incorrect_owner_key_burns_consent_request() {
-        let router = preview_router(test_state());
+        let state = test_state();
+        let router = preview_router(state.clone());
         let (cookie, request_id) = prepare_consent(&router).await;
-        let wrong = send_approval(&router, &cookie, &request_id, "wrong", ISSUER).await;
-        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
-        let replay = send_approval(&router, &cookie, &request_id, OWNER, ISSUER).await;
+        let before_approval = send_approval(&router, &cookie, &request_id, ISSUER).await;
+        assert_eq!(before_approval.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.approve_locally(&request_id, "wrong").await,
+            Err(OAuthError::Unauthorized)
+        );
+        assert_eq!(
+            state.approve_locally(&request_id, OWNER).await,
+            Err(OAuthError::InvalidRequest)
+        );
+        let replay = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn local_pending_list_and_emergency_revocation_are_not_http_endpoints() {
+        let state = test_state();
+        let router = authorization_router(state.clone());
+        let (cookie, id) = prepare_consent(&router).await;
+        let pending = state.pending_requests_locally().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, id);
+        assert_eq!(pending[0].client_id, CLIENT);
+        assert_eq!(pending[0].resource, RESOURCE);
+        assert_eq!(pending[0].scope, "catdesk:read");
+        let listing = call(&router, request("GET", "/pending-approvals")).await;
+        assert_eq!(listing.status(), StatusCode::NOT_FOUND);
+        let revoke = call(&router, request("POST", "/revoke-all")).await;
+        assert_eq!(revoke.status(), StatusCode::NOT_FOUND);
+
+        state.approve_locally(&id, OWNER).await.unwrap();
+        assert!(state.pending_requests_locally().await.is_empty());
+        let approved = send_approval(&router, &cookie, &id, ISSUER).await;
+        assert_eq!(approved.status(), StatusCode::SEE_OTHER);
+        let location = approved.headers()[header::LOCATION].to_str().unwrap();
+        let code = reqwest::Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .unwrap()
+            .1
+            .to_string();
+        let response = call(&router, token_request(&code, VERIFIER, RESOURCE)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_FORM_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let token = body["access_token"].as_str().unwrap();
+        assert!(
+            state
+                .store
+                .lock()
+                .await
+                .validate_token(token, RESOURCE, "catdesk:read")
+                .is_ok()
+        );
+
+        let (pending_cookie, pending_id) = prepare_consent(&router).await;
+        assert_eq!(
+            state.revoke_all_locally("wrong").await,
+            Err(OAuthError::Unauthorized)
+        );
+        assert!(
+            state
+                .store
+                .lock()
+                .await
+                .validate_token(token, RESOURCE, "catdesk:read")
+                .is_ok()
+        );
+        assert_eq!(state.pending_requests_locally().await.len(), 1);
+        state.revoke_all_locally(OWNER).await.unwrap();
+        assert!(state.pending_requests_locally().await.is_empty());
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .await
+                .validate_token(token, RESOURCE, "catdesk:read"),
+            Err(OAuthError::Unauthorized)
+        );
+        assert_eq!(
+            state.approve_locally(&pending_id, OWNER).await,
+            Err(OAuthError::InvalidRequest)
+        );
+        assert_eq!(
+            send_approval(&router, &pending_cookie, &pending_id, ISSUER)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]
@@ -1025,16 +1206,49 @@ mod tests {
 
     #[tokio::test]
     async fn owner_approval_rate_limit_is_global_and_fails_closed() {
-        let router = preview_router(test_state());
+        let state = test_state();
+        let router = preview_router(state.clone());
         for _ in 0..APPROVAL_MAX {
-            let (cookie, id) = prepare_consent(&router).await;
-            let response = send_approval(&router, &cookie, &id, "wrong", ISSUER).await;
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let (_, id) = prepare_consent(&router).await;
+            assert_eq!(
+                state.approve_locally(&id, "wrong").await,
+                Err(OAuthError::Unauthorized)
+            );
         }
+        let (_, id) = prepare_consent(&router).await;
+        assert_eq!(
+            state.approve_locally(&id, OWNER).await,
+            Err(OAuthError::CapacityExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_cannot_submit_owner_secret_to_public_handler() {
+        let state = test_state();
+        let router = preview_router(state.clone());
         let (cookie, id) = prepare_consent(&router).await;
-        let limited = send_approval(&router, &cookie, &id, OWNER, ISSUER).await;
-        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+        // Reject fields not explicitly in the contract, even if the
+        // attacker knows the real key.
+        let body = encode(&[("request_id", &id), ("owner_key", OWNER)]);
+        let response = call(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/authorize/approve")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ORIGIN, ISSUER)
+                .header(header::COOKIE, cookie.as_str())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // The actual owner's local approval still works afterwards.
+        state.approve_locally(&id, OWNER).await.unwrap();
+        assert_eq!(
+            send_approval(&router, &cookie, &id, ISSUER).await.status(),
+            StatusCode::SEE_OTHER
+        );
     }
 
     #[tokio::test]

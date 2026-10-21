@@ -201,6 +201,21 @@ impl OAuthStore {
         self.tokens.retain(|_, grant| grant.expires > now);
     }
 
+    pub fn validate_owner_key(&self, owner_key: &str) -> bool {
+        owner_key_valid(owner_key) && constant_time_eq(&self.owner_key_digest, &digest(owner_key))
+    }
+
+    /// Emergency local-only revocation. No bearer token or pending code can
+    /// survive this operation, including an unexchanged authorization code.
+    pub fn revoke_all_after_owner_approval(&mut self, owner_key: &str) -> Result<(), OAuthError> {
+        if !self.validate_owner_key(owner_key) {
+            return Err(OAuthError::Unauthorized);
+        }
+        self.codes.clear();
+        self.tokens.clear();
+        Ok(())
+    }
+
     pub fn validate_authorization(&self, req: &AuthorizationRequest) -> Result<(), OAuthError> {
         if req.response_type != "code"
             || req.client_id != CLIENT_ID
@@ -226,9 +241,7 @@ impl OAuthStore {
         owner_key: &str,
     ) -> Result<String, OAuthError> {
         self.validate_authorization(&req)?;
-        if !owner_key_valid(owner_key)
-            || !constant_time_eq(&self.owner_key_digest, &digest(owner_key))
-        {
+        if !self.validate_owner_key(owner_key) {
             return Err(OAuthError::Unauthorized);
         }
         self.prune();
@@ -536,6 +549,34 @@ mod tests {
         assert!(matches!(
             store.validate_token(&token, RESOURCE, READ_SCOPE),
             Err(OAuthError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn owner_emergency_revocation_clears_codes_and_access_tokens() {
+        let mut store = setup();
+        let exchanged_code = approved_code(&mut store);
+        let access = store
+            .exchange(token_request(&exchanged_code))
+            .unwrap()
+            .access_token;
+        let pending_code = approved_code(&mut store);
+        assert_eq!(
+            store.revoke_all_after_owner_approval("wrong"),
+            Err(OAuthError::Unauthorized)
+        );
+        assert!(store.validate_token(&access, RESOURCE, READ_SCOPE).is_ok());
+        assert!(store.codes.contains_key(&digest(&pending_code)));
+        store.revoke_all_after_owner_approval(OWNER).unwrap();
+        assert!(store.codes.is_empty());
+        assert!(store.tokens.is_empty());
+        assert_eq!(
+            store.validate_token(&access, RESOURCE, READ_SCOPE),
+            Err(OAuthError::Unauthorized)
+        );
+        assert!(matches!(
+            store.exchange(token_request(&pending_code)),
+            Err(OAuthError::InvalidGrant)
         ));
     }
 

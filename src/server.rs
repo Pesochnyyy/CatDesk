@@ -3457,6 +3457,8 @@ mod oauth_mcp_admission_tests {
             .split('"')
             .next()
             .unwrap();
+        assert!(!page.contains("name=\"owner_key\""));
+        assert!(oauth.approve_locally(id, OWNER).await.is_ok());
         let no_redirect = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -3465,7 +3467,7 @@ mod oauth_mcp_admission_tests {
             .post(format!("{root_url}/authorize/approve"))
             .header(reqwest::header::ORIGIN, ISSUER)
             .header(reqwest::header::COOKIE, cookie)
-            .form(&[("request_id", id), ("owner_key", OWNER)])
+            .form(&[("request_id", id)])
             .send()
             .await
             .unwrap();
