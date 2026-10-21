@@ -2148,7 +2148,7 @@ mod tests {
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let router = router(
-            app_state,
+            app_state.clone(),
             None,
             CommandJobManager::new(),
             "/secret-slug/mcp".to_string(),
@@ -2159,6 +2159,9 @@ mod tests {
             .await
             .expect("bind test listener");
         let addr = listener.local_addr().expect("test listener address");
+        // The test uses an ephemeral listener. Align AppState with its actual
+        // bound port so strict local Host validation remains intact.
+        app_state.lock().await.port = addr.port();
         let server = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await

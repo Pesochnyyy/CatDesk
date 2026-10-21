@@ -18,11 +18,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Compile
         run: cargo check --locked
       - name: Tests
         run: cargo test --locked
       - name: Formatting
+        if: always()
         run: cargo fmt --all -- --check
       - name: Lints
+        if: always()
         run: cargo clippy --all-targets --locked -- -D warnings
