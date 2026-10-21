@@ -90,6 +90,19 @@ fn router_with_oauth_admission(
         app: app_state.clone(),
         oauth: oauth_admission,
     };
+    // Bind the OAuth audience to the exact MCP endpoint in this router.
+    // Mismatch is a programming/configuration error: never issue tokens
+    // valid for another workspace or secret slug.
+    if let Some(oauth) = &auth_state.oauth {
+        assert_eq!(
+            reqwest::Url::parse(&oauth.settings.resource)
+                .expect("validated OAuth resource")
+                .path(),
+            mcp_path,
+            "OAuth resource must identify this exact MCP endpoint"
+        );
+    }
+    let oauth_routes = auth_state.oauth.clone();
     let state = ServerState {
         app: app_state,
         devtools,
@@ -108,7 +121,7 @@ fn router_with_oauth_admission(
     let token_stats_layout = format!("{secret_prefix}/layout/token-stats");
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
 
-    Router::new()
+    let mcp_router = Router::new()
         .route(&health_path, get(health))
         .route(
             &archive_save_path,
@@ -139,11 +152,17 @@ fn router_with_oauth_admission(
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            security::guard,
-        ))
+        .with_state(state);
+    let combined = if let Some(oauth) = oauth_routes {
+        mcp_router.merge(crate::oauth_http::authorization_router(oauth))
+    } else {
+        mcp_router
+    };
+    // One shared admission guard wraps both OAuth and MCP routes.
+    combined.layer(axum::middleware::from_fn_with_state(
+        auth_state,
+        security::guard,
+    ))
 }
 
 fn with_widget_action_cors(
@@ -3365,6 +3384,143 @@ mod oauth_mcp_admission_tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
         let endpoint = format!("http://{addr}/secret-slug/mcp");
+        let root_url = format!("http://{addr}");
+        let metadata = client
+            .get(format!(
+                "{root_url}/.well-known/oauth-protected-resource/secret-slug/mcp"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), reqwest::StatusCode::OK);
+        let metadata: Value = metadata.json().await.unwrap();
+        assert_eq!(metadata["resource"], RESOURCE);
+        let auth_server = client
+            .get(format!("{root_url}/.well-known/oauth-authorization-server"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(auth_server.status(), reqwest::StatusCode::OK);
+        let unexpected_preview = client
+            .get(format!("{root_url}/__oauth_preview/protected"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unexpected_preview.status(), reqwest::StatusCode::FORBIDDEN);
+        let no_code = client
+            .post(format!("{root_url}/token"))
+            .form(&[("grant_type", "authorization_code")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_code.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Exercise browser consent -> PKCE code -> token on THIS MCP server,
+        // without consulting the network in CI. The pinned CIMD document
+        // was verified separately by the R4 live HTTPS acceptance test.
+        assert!(oauth.verify_document_for_test(&json!({
+            "client_id": "https://chatgpt.com/oauth/client.json",
+            "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"]
+        })));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let mut authorize_url = reqwest::Url::parse(&format!("{root_url}/authorize")).unwrap();
+        authorize_url
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", "https://chatgpt.com/oauth/client.json")
+            .append_pair(
+                "redirect_uri",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+            )
+            .append_pair("resource", RESOURCE)
+            .append_pair("scope", "catdesk:read")
+            .append_pair("state", "opaque-client-csrf-state-0123456789")
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        let consent = client.get(authorize_url).send().await.unwrap();
+        assert_eq!(consent.status(), reqwest::StatusCode::OK);
+        let cookie = consent.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let page = consent.text().await.unwrap();
+        let id = page
+            .split("name=\"request_id\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let approved = no_redirect
+            .post(format!("{root_url}/authorize/approve"))
+            .header(reqwest::header::ORIGIN, ISSUER)
+            .header(reqwest::header::COOKIE, cookie)
+            .form(&[("request_id", id), ("owner_key", OWNER)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+        let callback = reqwest::Url::parse(
+            approved.headers()[reqwest::header::LOCATION]
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(callback.host_str(), Some("chatgpt.com"));
+        let browser_code = callback
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .unwrap()
+            .1
+            .to_string();
+        let exchanged = client
+            .post(format!("{root_url}/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", browser_code.as_str()),
+                ("code_verifier", VERIFIER),
+                ("client_id", "https://chatgpt.com/oauth/client.json"),
+                (
+                    "redirect_uri",
+                    "https://chatgpt.com/connector_platform_oauth_redirect",
+                ),
+                ("resource", RESOURCE),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exchanged.status(), reqwest::StatusCode::OK);
+        let body: Value = exchanged.json().await.unwrap();
+        let browser_token = body["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(
+            client
+                .get(&endpoint)
+                .bearer_auth(&browser_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        // Switching transports must NOT silently bypass OAuth protection.
+        app_state.lock().await.transport = TransportKind::Local;
+        let downgraded = client.get(&endpoint).send().await.unwrap();
+        assert_eq!(
+            downgraded.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        app_state.lock().await.transport = TransportKind::TailscaleFunnel;
 
         let no_token = client.get(&endpoint).send().await.unwrap();
         assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED);

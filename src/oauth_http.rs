@@ -270,7 +270,7 @@ impl OAuthHttpState {
     }
 
     #[cfg(test)]
-    fn verify_document_for_test(&self, document: &Value) -> bool {
+    pub(crate) fn verify_document_for_test(&self, document: &Value) -> bool {
         if !chatgpt_client_metadata_valid(document) {
             return false;
         }
@@ -279,13 +279,14 @@ impl OAuthHttpState {
     }
 }
 
-/// A deliberately separate preview router, never merged with server::router.
-pub fn preview_router(state: OAuthHttpState) -> Router {
+/// OAuth discovery and consent endpoints. Mount only when OAuth admission
+/// is explicitly enabled; this never includes the preview-only test route.
+pub fn authorization_router(state: OAuthHttpState) -> Router {
     let protected_path = format!(
         "/.well-known/oauth-protected-resource{}",
         reqwest::Url::parse(&state.settings.resource)
             .expect("validated")
-            .path()
+            .path(),
     );
     Router::new()
         .route(&protected_path, get(protected_metadata))
@@ -296,9 +297,34 @@ pub fn preview_router(state: OAuthHttpState) -> Router {
         .route("/authorize", get(authorization_form))
         .route("/authorize/approve", post(approve))
         .route("/token", post(token))
-        .route("/__oauth_preview/protected", get(preview_protected))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_FORM_BYTES))
+}
+
+/// Private in-process test router; this endpoint is NEVER mounted into
+/// the real MCP server, even when OAuth admission is explicitly supplied.
+pub fn preview_router(state: OAuthHttpState) -> Router {
+    let proof = Router::new()
+        .route("/__oauth_preview/protected", get(preview_protected))
+        .with_state(state.clone());
+    authorization_router(state).merge(proof)
+}
+
+/// Public metadata and OAuth routes are the only paths exempt from MCP Bearer
+/// validation. Widget and workspace routes are NEVER exempt.
+pub fn is_authorization_route(path: &str, method: &axum::http::Method, resource: &str) -> bool {
+    let protected = format!(
+        "/.well-known/oauth-protected-resource{}",
+        reqwest::Url::parse(resource)
+            .expect("validated OAuth resource")
+            .path()
+    );
+    (method == axum::http::Method::GET
+        && (path == protected
+            || path == "/.well-known/oauth-authorization-server"
+            || path == "/authorize"))
+        || (method == axum::http::Method::POST
+            && (path == "/authorize/approve" || path == "/token"))
 }
 
 async fn protected_metadata(State(state): State<OAuthHttpState>) -> Response {
@@ -706,6 +732,39 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[test]
+    fn oauth_route_exemptions_are_exact_and_do_not_include_widget_endpoints() {
+        use axum::http::Method;
+        let candidates = [
+            (
+                "/.well-known/oauth-protected-resource/example-secret/mcp",
+                Method::GET,
+            ),
+            ("/.well-known/oauth-authorization-server", Method::GET),
+            ("/authorize", Method::GET),
+            ("/authorize/approve", Method::POST),
+            ("/token", Method::POST),
+        ];
+        for (path, method) in candidates {
+            assert!(is_authorization_route(path, &method, RESOURCE), "{path}");
+        }
+        for (path, method) in [
+            ("/__oauth_preview/protected", Method::GET),
+            ("/example-secret/mcp", Method::GET),
+            ("/example-secret/agents/path-state", Method::GET),
+            ("/example-secret/layout/token-stats", Method::POST),
+            (
+                "/.well-known/oauth-protected-resource/other/mcp",
+                Method::GET,
+            ),
+            ("/authorize/approve", Method::GET),
+            ("/token", Method::GET),
+            ("/token/anything", Method::POST),
+        ] {
+            assert!(!is_authorization_route(path, &method, RESOURCE), "{path}");
+        }
     }
 
     #[tokio::test]

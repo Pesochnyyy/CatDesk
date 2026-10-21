@@ -90,6 +90,9 @@ pub async fn guard(
         .unwrap_or("");
     let local = loopback_host(host, port);
     let funnel_guard = funnel_auth_required(kind, owned, pending_route);
+    if admission.oauth.is_some() && !funnel_guard {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
 
     if funnel_guard {
         // While OAuth and widget-scoped authorization are unavailable, expose
@@ -101,12 +104,38 @@ pub async fn guard(
         let health = format!("/{slug}");
         let mcp = format!("{health}/mcp");
         let health_ok = p == health && request.method() == Method::GET;
+        let oauth_route = admission.oauth.as_ref().is_some_and(|oauth| {
+            crate::oauth_http::is_authorization_route(p, request.method(), &oauth.settings.resource)
+        });
         let mcp_ok = p == mcp
             && (request.method() == Method::GET
                 || request.method() == Method::POST
                 || request.method() == Method::DELETE);
-        if !health_ok && !mcp_ok {
+        if !health_ok && !mcp_ok && !oauth_route {
             return StatusCode::FORBIDDEN.into_response();
+        }
+        if oauth_route {
+            // OAuth discovery and consent have to work without an MCP token.
+            // This exception never includes widget or workspace endpoints.
+            if !local && url_host(base_url.as_deref()) != Some(host) {
+                return StatusCode::MISDIRECTED_REQUEST.into_response();
+            }
+            if p == "/authorize/approve" {
+                let issuer = &admission
+                    .oauth
+                    .as_ref()
+                    .expect("OAuth route")
+                    .settings
+                    .issuer;
+                if headers
+                    .get(header::ORIGIN)
+                    .and_then(|value| value.to_str().ok())
+                    != Some(issuer.as_str())
+                {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+            }
+            return next.run(request).await;
         }
         let supplied = headers
             .get(header::AUTHORIZATION)
