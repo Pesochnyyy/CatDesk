@@ -810,6 +810,17 @@ mod tests {
     }
 
     #[test]
+    fn all_tailscale_cli_calls_select_dedicated_socket() {
+        let command = original_tailscale_command().expect("dedicated Tailscale CLI command");
+        let expected = format!(
+            "--socket={}",
+            original_tailscale_socket().unwrap().display()
+        );
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, vec![std::ffi::OsStr::new(&expected)]);
+    }
+
+    #[test]
     fn url_mask_does_not_include_slug() {
         assert_eq!(
             masked_url("https://mac.tailnet.ts.net"),

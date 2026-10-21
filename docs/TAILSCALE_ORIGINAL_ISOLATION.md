@@ -11,26 +11,31 @@ This document applies only to the separate original Xeift/CatDesk clone. It must
 - Missing original socket permits `local` or legacy `ngrok` only when no Funnel binding was saved. An existing binding blocks startup until routing can be checked.
 - Public Funnel stays **disabled** unless the explicit read-only lab gates and bearer are configured. This is NOT ChatGPT OAuth authorization.
 
-## Prepare a separate daemon (not run automatically)
+## macOS background service
 
-On the Mac, in a regular Terminal:
+The dedicated daemon is installed as a user LaunchAgent on the development Mac:
 
-```sh
-install -d -m 700 "$HOME/.catdesk-original-tailscale"
-/opt/homebrew/bin/tailscaled \
-  --tun=userspace-networking \
-  --socket="$HOME/.catdesk-original-tailscale/tailscaled.sock" \
-  --statedir="$HOME/.catdesk-original-tailscale" \
-  --state="$HOME/.catdesk-original-tailscale/tailscaled.state"
-```
+- Label: `dev.catdesk.original.tailscaled`
+- File: `~/Library/LaunchAgents/dev.catdesk.original.tailscaled.plist`
+- Executable: `/opt/homebrew/bin/tailscaled`
+- Arguments: `--tun=userspace-networking`, `--socket=$HOME/.catdesk-original-tailscale/tailscaled.sock`, `--statedir=$HOME/.catdesk-original-tailscale`, `--state=$HOME/.catdesk-original-tailscale/tailscaled.state` (all `$HOME` values are expanded to absolute paths in the plist)
+- RunAtLoad and KeepAlive are enabled, so Wi-Fi changes do not depend on a Terminal window being open.
 
-Keep the daemon running in that Terminal during setup. In another Terminal use **only** the dedicated socket:
+Inspect and confirm the dedicated instance (no public route changes):
 
 ```sh
-/opt/homebrew/bin/tailscale --socket="$HOME/.catdesk-original-tailscale/tailscaled.sock" up
+launchctl print gui/$(id -u)/dev.catdesk.original.tailscaled
 /opt/homebrew/bin/tailscale --socket="$HOME/.catdesk-original-tailscale/tailscaled.sock" status
 /opt/homebrew/bin/tailscale --socket="$HOME/.catdesk-original-tailscale/tailscaled.sock" funnel status --json
 ```
+
+If the status is `NeedsLogin`, authorize the *new* original CatDesk node using the one-time link returned by this command:
+
+```sh
+/opt/homebrew/bin/tailscale --socket="$HOME/.catdesk-original-tailscale/tailscaled.sock" up --hostname=catdesk-original-mac --accept-dns=false --timeout=30s
+```
+
+This login only joins the Tailnet; it does **not** enable Funnel. Never start another daemon using the independent project's existing socket or state. To inspect logs, see `~/.catdesk-original-tailscale/tailscaled.stderr.log`.
 
 Do **not** run plain `tailscale funnel`, `tailscale funnel reset`, or target an existing socket owned by another application. Do not publish the service until OAuth and widget authorization are implemented and reviewed.
 
