@@ -3,6 +3,7 @@
 //! This bearer mechanism is for transport acceptance, NOT proof of ChatGPT OAuth support.
 use crate::state::{FunnelBinding, SharedState, TransportKind};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -47,13 +48,34 @@ pub fn public_hostname(status: &Value) -> Result<String, String> {
     Ok(host.to_owned())
 }
 
+/// The original CatDesk must never operate the socket of another Tailscale
+/// installation (including the independent CatDesk server on this Mac).
+/// A dedicated userspace tailscaled instance owns this private socket/state.
+fn original_tailscale_socket() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or("HOME is missing; cannot choose an isolated Tailscale socket")?;
+    Ok(PathBuf::from(home)
+        .join(".catdesk-original-tailscale")
+        .join("tailscaled.sock"))
+}
+
+fn original_tailscale_command() -> Result<Command, String> {
+    let socket = original_tailscale_socket()?;
+    let program = ["/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or("tailscale");
+    let mut command = Command::new(program);
+    command.arg(format!("--socket={}", socket.display()));
+    Ok(command)
+}
+
 async fn tailscale(args: &[&str]) -> Result<String, String> {
+    let mut command = original_tailscale_command()?;
     let output = tokio::time::timeout(
         Duration::from_secs(12),
-        Command::new("tailscale")
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
+        command.args(args).kill_on_drop(true).output(),
     )
     .await
     .map_err(|_| "Tailscale CLI timed out".to_owned())?
@@ -202,26 +224,26 @@ fn matches_owned_route(config: &Value, binding: &FunnelBinding) -> bool {
 /// installed but its status is unknown, refuse to open the listener; a stale
 /// --bg Funnel may still be active and reverse proxy to the same local port.
 pub async fn local_start_safe(previously_exposed: bool) -> Result<(), String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(12),
-        Command::new("tailscale")
-            .arg("version")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "Tailscale health check timed out; listener blocked".to_string())?;
-    match output {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !previously_exposed => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
-            Err("Previous Funnel ownership exists, but Tailscale CLI is missing: listener blocked".into()),
-        Err(_) => Err("Unable to determine Tailscale installation status; local listener blocked".into()),
-        Ok(output) if !output.status.success() => Err("Tailscale installation is present but unhealthy; local listener blocked".into()),
-        Ok(_) => match other_routing_active().await {
-            Ok(false) => Ok(()),
-            Ok(true) => Err("Tailscale Serve/Funnel routing is configured. Disable or isolate those routes before starting local/ngrok".into()),
-            Err(error) => Err(format!("Cannot prove that background Tailscale Serve/Funnel routing is disabled: {error}")),
-        },
+    // This project only uses ~/.catdesk-original-tailscale/tailscaled.sock;
+    // it must not query or mutate the independent CatDesk daemon. With no
+    // dedicated daemon/socket and no persisted exposure, the local listener
+    // cannot have an owned background Funnel to revive.
+    if !original_tailscale_socket()?.exists() {
+        return if previously_exposed {
+            Err("Saved Funnel ownership exists but the original CatDesk Tailscale socket is missing; listener blocked".into())
+        } else {
+            Ok(())
+        };
+    }
+    match other_routing_active().await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(
+            "Original CatDesk Tailscale Serve/Funnel routing is configured; listener blocked"
+                .into(),
+        ),
+        Err(error) => Err(format!(
+            "Cannot verify the dedicated original CatDesk Tailscale daemon: {error}"
+        )),
     }
 }
 
@@ -770,6 +792,23 @@ mod tests {
         route["TCP"]["443"]["TCPForward"] = serde_json::json!("127.0.0.1:7777");
         assert!(!matches_owned_route(&route, &binding));
     }
+    #[test]
+    fn dedicated_socket_is_not_system_or_other_catdesk() {
+        let socket = original_tailscale_socket().expect("HOME required for dedicated socket");
+        assert_eq!(socket.file_name().unwrap(), "tailscaled.sock");
+        assert!(
+            socket
+                .to_string_lossy()
+                .contains(".catdesk-original-tailscale/")
+        );
+        assert_ne!(socket, PathBuf::from("/var/run/tailscaled.socket"));
+        assert!(
+            !socket
+                .to_string_lossy()
+                .contains("CatDesk-Core-Independent")
+        );
+    }
+
     #[test]
     fn url_mask_does_not_include_slug() {
         assert_eq!(
