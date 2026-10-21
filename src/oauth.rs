@@ -1,9 +1,10 @@
-//! Offline OAuth authorization core for the *original* CatDesk clone.
+//! OAuth authorization core for the *original* CatDesk clone.
 //!
-//! This module is NOT connected to the HTTP router. No public OAuth
-//! authorization endpoints or OAuth token acceptance are enabled yet.
-//! Linking it to HTTP requires a reviewed owner-consent UI, client verification,
-//! rate limits, persistent revocation and widget scope enforcement.
+//! R5 integrates this with an explicitly test-injected HTTP router, and R6/R7
+//! provide local-only owner confirmation and controls. Normal production
+//! startup still does NOT enable OAuth or a public MCP authorization service.
+//! Release requires reviewed owner authentication, durable session/revocation
+//! policy and per-widget permissions.
 #![allow(dead_code)]
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

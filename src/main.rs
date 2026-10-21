@@ -13,6 +13,7 @@ mod mcp;
 mod ngrok;
 mod oauth;
 mod oauth_http;
+mod oauth_owner_tui;
 mod process_runner;
 mod security;
 mod server;
@@ -1936,7 +1937,9 @@ async fn run_app(
     run_chatgpt_connector_refresh_notice(terminal, state.clone(), &mut ui_event_rx).await?;
 
     // Phase 2: main TUI loop
-    run_tui(terminal, state, devtools_bridge, ui_event_rx).await
+    // The native owner UI is ready, but the production router has no OAuth
+    // session until authentication release gates have been accepted.
+    run_tui(terminal, state, devtools_bridge, ui_event_rx, None).await
 }
 
 async fn run_chatgpt_connector_refresh_notice(
@@ -5566,6 +5569,7 @@ async fn run_tui(
     state: SharedState,
     _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     mut ui_events: UnboundedReceiver<ServerUiEvent>,
+    owner_oauth: Option<oauth_http::OAuthHttpState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
@@ -5698,6 +5702,10 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('a') => {
+                            oauth_owner_tui::run_owner_panel(terminal, owner_oauth.as_ref())
+                                .await?;
+                        }
                         KeyCode::Char('t') => match transport::stop(state.clone()).await {
                             Err(error) => {
                                 let mut app = state.lock().await;
@@ -6636,7 +6644,9 @@ fn draw_ui(
         Span::styled("[End]", Style::default().fg(palette.key_fg)),
         Span::raw(ui_language.text(" Latest  ", " 最新  ")),
         Span::styled("[e]", Style::default().fg(palette.key_fg)),
-        Span::raw(ui_language.text(" Export logs", " 匯出紀錄")),
+        Span::raw(ui_language.text(" Export logs  ", " 匯出紀錄  ")),
+        Span::styled("[a]", Style::default().fg(palette.key_fg)),
+        Span::raw(ui_language.text(" OAuth owner", " OAuth 所有者")),
     ];
     let keys = Paragraph::new(Line::from(key_spans)).block(
         Block::default()

@@ -1,7 +1,8 @@
-//! HTTP OAuth R2 preview for original CatDesk.
+//! Test-injected OAuth HTTP routes for the original CatDesk.
 //!
-//! IMPORTANT: NOT mounted in the production MCP router. Do not expose publicly
-//! until client registration, consent and token admission have passed security review.
+//! Normal production startup leaves OAuth disabled. R6 requires explicit
+//! local owner approval and R7 prepares a native-only UI for that decision.
+//! Do not publish these routes or privileged MCP tools before release review.
 #![allow(dead_code)]
 
 use crate::oauth::{
@@ -346,6 +347,18 @@ impl OAuthHttpState {
             .collect();
         approvals.sort_by(|a, b| a.request_id.cmp(&b.request_id));
         approvals
+    }
+
+    /// Deny an outstanding request from the native terminal UI. The request
+    /// is consumed, and no code or token is issued. Never expose via HTTP.
+    pub(crate) async fn deny_locally(&self, request_id: &str) -> bool {
+        let mut consent = self.consent.lock().await;
+        if let Some(pending) = consent.get(request_id) {
+            if pending.approved_redirect.is_some() || pending.expires_at <= Instant::now() {
+                return false;
+            }
+        }
+        consent.remove(request_id).is_some()
     }
 
     /// Owner-only emergency revocation; never mount as an HTTP endpoint.
@@ -1045,6 +1058,37 @@ mod tests {
         );
         let replay = send_approval(&router, &cookie, &request_id, ISSUER).await;
         assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn native_denial_consumes_only_pending_request_and_never_issues_code() {
+        let state = test_state();
+        let router = authorization_router(state.clone());
+        let (cookie, request_id) = prepare_consent(&router).await;
+        assert_eq!(state.pending_requests_locally().await.len(), 1);
+        assert!(state.deny_locally(&request_id).await);
+        assert!(!state.deny_locally(&request_id).await);
+        assert!(state.pending_requests_locally().await.is_empty());
+        assert_eq!(
+            state.approve_locally(&request_id, OWNER).await,
+            Err(OAuthError::InvalidRequest)
+        );
+        assert_eq!(
+            send_approval(&router, &cookie, &request_id, ISSUER)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let (new_cookie, new_id) = prepare_consent(&router).await;
+        state.approve_locally(&new_id, OWNER).await.unwrap();
+        // An already locally approved request cannot be silently cancelled.
+        assert!(!state.deny_locally(&new_id).await);
+        assert_eq!(
+            send_approval(&router, &new_cookie, &new_id, ISSUER)
+                .await
+                .status(),
+            StatusCode::SEE_OTHER
+        );
     }
 
     #[tokio::test]
