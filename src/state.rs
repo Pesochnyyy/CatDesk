@@ -323,9 +323,34 @@ pub fn save_widget_corner_style(style: WidgetCornerStyle) -> std::io::Result<Pat
     Ok(path)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    #[default]
+    Ngrok,
+    TailscaleFunnel,
+    Local,
+}
+impl TransportKind {
+    pub fn label(self) -> &'static str {
+        match self { Self::Ngrok => "ngrok", Self::TailscaleFunnel => "Tailscale Funnel", Self::Local => "local" }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FunnelBinding {
+    pub hostname: String,
+    pub port: u16,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)]
+    pub transport: Option<TransportKind>,
+    #[serde(default)]
+    pub funnel_binding: Option<FunnelBinding>,
     pub ngrok_authtoken: Option<String>,
     pub mcp_slug: Option<String>,
     pub ngrok_domain: Option<String>,
@@ -368,6 +393,8 @@ fn default_sandbox_enabled() -> bool {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            transport: None,
+            funnel_binding: None,
             ngrok_authtoken: None,
             mcp_slug: None,
             ngrok_domain: None,
@@ -643,6 +670,12 @@ impl ToolMode {
 
 /// Shared application state across server, ngrok, and TUI.
 pub struct AppState {
+    pub transport: TransportKind,
+    pub transport_running: bool,
+    pub transport_url: Option<String>,
+    pub transport_error: Option<String>,
+    pub tailscale_owned: bool,
+    pub funnel_binding: Option<FunnelBinding>,
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
@@ -988,6 +1021,12 @@ impl AppState {
         config_path: PathBuf,
     ) -> std::io::Result<Self> {
         let config = AppConfig::load_from_path(&config_path)?;
+        // Keep legacy ngrok users unchanged; new users default to local until selected.
+        let transport = config.transport.unwrap_or_else(|| {
+            if config.ngrok_authtoken.is_some() || config.ngrok_domain.is_some() {
+                TransportKind::Ngrok
+            } else { TransportKind::Local }
+        });
         let partner_binagotchy_seed = config.partner_binagotchy_seed.clone();
         let mascot_seed = if let Some(seed) = partner_binagotchy_seed.as_deref() {
             parse_seed_hex(seed)?
@@ -999,7 +1038,8 @@ impl AppState {
         if partner_binagotchy_seed.is_none() {
             mascot::archive_startup_mascot(mascot_seed)?;
         }
-        let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
+        let is_returning_user = config.mcp_slug.is_some()
+            && (config.ngrok_domain.is_some() || config.funnel_binding.is_some());
         let stored_connector_revision = config.chatgpt_connector_revision;
         let chatgpt_connector_refresh_required = is_returning_user
             && stored_connector_revision.unwrap_or(0) < CURRENT_CHATGPT_CONNECTOR_REVISION;
@@ -1014,6 +1054,12 @@ impl AppState {
         };
 
         Ok(Self {
+            transport,
+            transport_running: false,
+            transport_url: None,
+            transport_error: None,
+            tailscale_owned: false,
+            funnel_binding: config.funnel_binding,
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
@@ -1066,12 +1112,15 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
-        self.ngrok_url
-            .as_ref()
+        self.transport_url.as_ref()
+            .or_else(|| (self.transport == TransportKind::Ngrok).then_some(self.ngrok_url.as_ref()).flatten())
             .map(|url| format!("{url}{}", self.mcp_path()))
     }
 
     pub fn log(&mut self, level: &'static str, message: String) {
+        // Do not place the secret route in logs in ANY transport mode.
+        // Covers both direct MCP route logs and absolute URLs with this slug.
+        let message = message.replace(&format!("/{}", self.mcp_slug), "/[secret]");
         let now = now_hms();
         let id = self.next_log_id;
         self.next_log_id = self.next_log_id.checked_add(1).expect("log id exhausted");
@@ -1088,6 +1137,8 @@ impl AppState {
 
     fn app_config(&self) -> std::io::Result<AppConfig> {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
+        config.transport = Some(self.transport);
+        config.funnel_binding = self.funnel_binding.clone();
         config.mcp_slug = Some(self.mcp_slug.clone());
         config.ngrok_domain = self.ngrok_domain.clone();
         config.last_started_version = Some(env!("CARGO_PKG_VERSION").to_string());

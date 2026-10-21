@@ -16,15 +16,39 @@ use std::sync::{
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
+use crate::security;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::state::{
-    AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
+    Mode, ToolMode, TransportKind, AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
     TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
     save_token_stats_layout,
 };
 
 const STATELESS_FLOW_ID: &str = "stateless";
+
+/// A second authorization boundary at the point of MCP dispatch, separate
+/// from the HTTP middleware. No other public tool is allowed during the lab.
+fn funnel_lab_tool_allowed(name: Option<&str>) -> bool {
+    matches!(name, Some("catdesk_instruction" | "read" | "search"))
+}
+
+#[cfg(test)]
+mod funnel_dispatch_policy_tests {
+    use super::funnel_lab_tool_allowed;
+    #[test]
+    fn only_safe_tools_are_callable() {
+        for name in ["catdesk_instruction", "read", "search"] {
+            assert!(funnel_lab_tool_allowed(Some(name)));
+        }
+        for name in ["run_command", "write", "edit", "delete",
+                     "create_handoff", "start_command", "cancel_command"] {
+            assert!(!funnel_lab_tool_allowed(Some(name)));
+        }
+        assert!(!funnel_lab_tool_allowed(None));
+    }
+}
+
 
 #[derive(Clone)]
 struct ServerState {
@@ -43,6 +67,7 @@ pub fn router(
     mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,
 ) -> Router {
+    let auth_state = app_state.clone();
     let state = ServerState {
         app: app_state,
         devtools,
@@ -93,6 +118,7 @@ pub fn router(
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(auth_state, security::guard))
 }
 
 fn with_widget_action_cors(
@@ -2976,7 +3002,7 @@ async fn post_mcp_inner(
             app.set_catdesk_as_co_author,
             app.handoff_enabled,
             app.sandbox_enabled,
-            app.ngrok_url.clone(),
+            app.transport_url.clone().or_else(|| app.ngrok_url.clone()),
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
             app.show_detail_mode,
@@ -2996,6 +3022,27 @@ async fn post_mcp_inner(
         return response;
     }
 
+    // Re-check authorization at execution time: mode/tool_mode can change
+    // between HTTP admission and MCP dispatch. Keep the public transport
+    // strictly Computer + ReadOnly regardless of interactive TUI changes.
+    let public_lab_guard = {
+        let app = s.app.lock().await;
+        app.transport == TransportKind::TailscaleFunnel
+            || app.tailscale_owned || app.funnel_binding.is_some()
+    };
+    if public_lab_guard && req.method == "tools/call"
+        && !funnel_lab_tool_allowed(req.params.get("name").and_then(Value::as_str))
+    {
+        return modern_jsonrpc_error_response(
+            StatusCode::FORBIDDEN, req.id.as_ref(), -32003,
+            "Tool denied by public read-only transport policy", None,
+        );
+    }
+    let (mode, tool_mode, handoff_enabled, sandbox_enabled) = if public_lab_guard {
+        (Mode::Computer, ToolMode::ReadOnly, false, true)
+    } else {
+        (mode, tool_mode, handoff_enabled, sandbox_enabled)
+    };
     let show_detail_mode = show_detail_mode.unwrap_or(app_show_detail_mode);
     let response = mcp::handle_request_with_show_detail_mode(
         &req,

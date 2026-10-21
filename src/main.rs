@@ -11,6 +11,8 @@ mod macos_terminal;
 mod mascot;
 mod mcp;
 mod ngrok;
+mod transport;
+mod security;
 mod process_runner;
 mod server;
 mod startup;
@@ -27,6 +29,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use devtools::DevtoolsBridge;
+use state::TransportKind;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -1312,8 +1315,8 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
 }
 
 fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
-    let both_running = app.server_running && app.ngrok_running;
-    let has_url = app.ngrok_url.is_some();
+    let both_running = app.server_running && app.transport_running;
+    let has_url = app.public_mcp_url().is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -1448,7 +1451,7 @@ fn build_animation_snapshot(app: &AppState) -> Vec<String> {
         let closing = flow.closing_started_ms.is_some();
         let lane_active = closing
             || !flow.anim_queue.is_empty()
-            || (app.server_running && app.ngrok_running && app.remote_connected);
+            || (app.server_running && app.transport_running && app.remote_connected);
         let direction = Some(flow_direction(Some(flow), now_millis)).filter(|_| lane_active);
         let phase = flow_phase(flow, now_millis);
         let lit = flow_lit_count(Some(flow), now_millis, FLOW_ROW_CELLS);
@@ -1758,6 +1761,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
 
+    // The persistent --bg Funnel must be switched off before the local server exits.
+    if let Err(error) = transport::stop(state.clone()).await {
+        eprintln!("CatDesk transport shutdown not verified: {error}");
+    }
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     let command_jobs = { state.lock().await.command_jobs.clone() };
     command_jobs.cancel_all().await;
@@ -1783,6 +1790,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     result
+}
+
+async fn run_transport_select(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: SharedState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut notice = String::new();
+    loop {
+        let current = state.lock().await.transport;
+        terminal.draw(|frame| {
+            let text = vec![
+                Line::from("Choose CatDesk transport (Enter keeps saved choice):"),
+                Line::from(""),
+                Line::from("1  Tailscale Funnel (public; Bearer authentication required)"),
+                Line::from("2  ngrok (legacy)"),
+                Line::from("3  Local (no public transport)"),
+                Line::from(""),
+                Line::from(format!("Current: {}   |   q: quit", current.label())),
+                Line::from(notice.clone()),
+            ];
+            frame.render_widget(Paragraph::new(text).block(Block::default().title(" Transport ").borders(Borders::ALL)), frame.area());
+        })?;
+        if event::poll(UI_POLL_INTERVAL)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
+                let selected = match key.code {
+                    KeyCode::Char('1') => Some(TransportKind::TailscaleFunnel),
+                    KeyCode::Char('2') => Some(TransportKind::Ngrok),
+                    KeyCode::Char('3') => Some(TransportKind::Local),
+                    KeyCode::Enter => Some(current),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    _ => None,
+                };
+                if let Some(kind) = selected {
+                    // A persistent --bg Funnel must be removed BEFORE saving a less
+                    // protected transport. On a daemon error, refuse the switch.
+                    // Switching away from Funnel also works after an app crash:
+                    // a persisted binding is an intent record, not proof of
+                    // current-process ownership. transport::stop verifies exact
+                    // Tailscale routing before disabling this application's path.
+                    let stale_binding = state.lock().await.funnel_binding.is_some();
+                    if kind != TransportKind::TailscaleFunnel
+                        && (current == TransportKind::TailscaleFunnel || stale_binding) {
+                        if let Err(error) = transport::stop(state.clone()).await {
+                            notice = format!("Cannot safely switch transport: {error}");
+                            continue;
+                        }
+                    }
+                    let mut app = state.lock().await;
+                    app.transport = kind;
+                    app.persist_state()?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
 }
 
 // ── Phase 1: Mode selection ─────────────────────────────────
@@ -1842,14 +1905,13 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
-    if !continue_run {
-        return Ok(());
-    }
-
-    let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
-    if !continue_run {
-        return Ok(());
+    // Select transport without reinstalling. Existing ngrok configuration is preserved.
+    if !run_transport_select(terminal, state.clone()).await? { return Ok(()); }
+    if state.lock().await.transport == TransportKind::Ngrok {
+        let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
+        if !continue_run { return Ok(()); }
+        let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
+        if !continue_run { return Ok(()); }
     }
 
     // Start services
@@ -5438,6 +5500,15 @@ async fn start_services(
         mcp_path,
         ui_events,
     );
+    // Fail closed when --bg Funnel may have survived a reboot, network failure,
+    // crash, or transport choice change. Unknown status is NOT evidence of safety.
+    if state.lock().await.transport != TransportKind::TailscaleFunnel {
+        let previously_exposed = state.lock().await.funnel_binding.is_some();
+        if let Err(error) = transport::local_start_safe(previously_exposed).await {
+            state.lock().await.log("ERROR", error);
+            return devtools_bridge;
+        }
+    }
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
         Ok(l) => l,
         Err(e) => {
@@ -5460,9 +5531,14 @@ async fn start_services(
         app.log("INFO", format!("MCP Server started on port {port}"));
     }
 
-    // Start ngrok
-    if let Err(e) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {e}"));
+    // Only launch the selected transport. Auth failure leaves the server local.
+    if let Err(e) = transport::start(state.clone()).await {
+        let mut app = state.lock().await;
+        app.transport_error = Some(e.clone());
+        app.log("ERROR", e);
+    }
+    if state.lock().await.transport == TransportKind::TailscaleFunnel {
+        tokio::spawn(transport::monitor(state.clone()));
     }
 
     devtools_bridge
@@ -5607,6 +5683,23 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('t') => {
+                            match transport::stop(state.clone()).await {
+                                Err(error) => {
+                                    let mut app = state.lock().await;
+                                    app.transport_error = Some(error.clone());
+                                    app.log("ERROR", format!("Transport stop blocked restart: {error}"));
+                                }
+                                Ok(()) => match transport::start(state.clone()).await {
+                                    Ok(()) => state.lock().await.log("INFO", "Transport restarted".into()),
+                                    Err(error) => {
+                                        let mut app = state.lock().await;
+                                        app.transport_error = Some(error.clone());
+                                        app.log("ERROR", format!("Transport restart failed: {error}"));
+                                    }
+                                }
+                            }
+                        }
                         KeyCode::Char('e') => {
                             let export_result = {
                                 let app = state.lock().await;
@@ -5871,7 +5964,7 @@ fn draw_ui(
         .unwrap_or_default()
         .as_millis();
 
-    let has_url = app.ngrok_url.is_some();
+    let has_url = app.public_mcp_url().is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -5913,12 +6006,14 @@ fn draw_ui(
         if ui_language.is_traditional_chinese() {
             format!("執行中（連接埠 {}）", app.port)
         } else {
-            format!("RUNNING (port {})", app.port)
+            format!("RUNNING (http://127.0.0.1:{})", app.port)
         }
     } else {
         ui_language.text("STOPPED", "已停止").into()
     };
-    let ngrok_status: &str = if app.ngrok_running {
+    let ngrok_status: &str = if let Some(error) = app.transport_error.as_deref() {
+        error
+    } else if app.transport_running {
         ui_language.text("RUNNING", "執行中")
     } else {
         ui_language.text("STOPPED", "已停止")
@@ -5934,7 +6029,9 @@ fn draw_ui(
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
         (Some(url), true) => url.clone(),
-        (Some(_), false) => MCP_URL_MASK.to_string(),
+        (Some(url), false) => url.strip_suffix(&app.mcp_path())
+            .map(transport::masked_url)
+            .unwrap_or_else(|| MCP_URL_MASK.to_string()),
         (None, _) => "--".to_string(),
     };
     let mcp_url_security_status = mcp_url_reveal_remaining.map(|remaining| {
@@ -6039,10 +6136,10 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("ngrok"),
+            status_label(app.transport.label()),
             Span::styled(
                 ngrok_status,
-                Style::default().fg(if app.ngrok_running {
+                Style::default().fg(if app.transport_running {
                     palette.success_fg
                 } else {
                     palette.danger_fg
@@ -6247,7 +6344,7 @@ fn draw_ui(
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
-                    || (app.server_running && app.ngrok_running && app.remote_connected);
+                    || (app.server_running && app.transport_running && app.remote_connected);
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
                     Span::styled("    ", Style::default().fg(palette.muted_fg)),

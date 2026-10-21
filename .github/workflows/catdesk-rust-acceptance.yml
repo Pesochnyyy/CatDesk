@@ -1,0 +1,28 @@
+name: CatDesk Rust Acceptance
+
+on:
+  push:
+    branches:
+      - feature/catdesk-tailscale-funnel-acceptance
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Compile
+        run: cargo check --locked
+      - name: Tests
+        run: cargo test --locked
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lints
+        run: cargo clippy --all-targets --locked -- -D warnings
