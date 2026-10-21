@@ -11,6 +11,7 @@ mod macos_terminal;
 mod mascot;
 mod mcp;
 mod ngrok;
+mod oauth;
 mod process_runner;
 mod security;
 mod server;
