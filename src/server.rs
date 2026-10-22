@@ -63,6 +63,7 @@ struct ServerState {
     command_jobs: CommandJobManager,
     ui_events: UnboundedSender<ServerUiEvent>,
     catdesk_instruction_called: Arc<AtomicBool>,
+    oauth_read_only: bool,
 }
 
 /// Build the axum router.
@@ -109,6 +110,7 @@ pub(crate) fn router_with_oauth_admission(
         command_jobs,
         ui_events,
         catdesk_instruction_called: Arc::new(AtomicBool::new(false)),
+        oauth_read_only: auth_state.oauth.is_some(),
     };
     let secret_prefix = mcp_path
         .strip_suffix("/mcp")
@@ -1592,6 +1594,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         sync_show_detail_mode_state(&server_state, ShowDetailMode::Disable).await;
@@ -1628,6 +1631,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let response = post_mcp(
@@ -1678,6 +1682,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let response = post_mcp(
@@ -1736,6 +1741,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let response = post_mcp(
@@ -1809,6 +1815,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let response = post_mcp(
@@ -1951,6 +1958,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let discover = post_mcp_http(
@@ -2098,6 +2106,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let legacy_shape = post_mcp_http(
@@ -2480,6 +2489,7 @@ mod tests {
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
         let command = if cfg!(windows) {
             "Start-Sleep -Milliseconds 250; Write-Output http-job-done"
@@ -2598,6 +2608,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: instruction_called.clone(),
+            oauth_read_only: false,
         };
 
         let blocked_response = post_mcp(
@@ -2707,6 +2718,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: instruction_called.clone(),
+            oauth_read_only: false,
         };
 
         let discover = post_mcp_json_with_show_detail_mode(
@@ -2881,6 +2893,7 @@ mod tests {
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+            oauth_read_only: false,
         };
 
         let response = post_mcp(
@@ -3083,10 +3096,30 @@ async fn post_mcp_inner(
     // strictly Computer + ReadOnly regardless of interactive TUI changes.
     let public_lab_guard = {
         let app = s.app.lock().await;
-        app.transport == TransportKind::TailscaleFunnel
+        s.oauth_read_only
+            || app.transport == TransportKind::TailscaleFunnel
             || app.tailscale_owned
             || app.funnel_binding.is_some()
     };
+    // Widget resources are not covered by the minimal catdesk:read OAuth
+    // scope. Deny discovery/templates until separate widget permissions exist.
+    if s.oauth_read_only
+        && (req.method == "resources/list"
+            || (req.method == "resources/read"
+                && req
+                    .params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(mcp::is_catdesk_widget_resource_uri)))
+    {
+        return modern_jsonrpc_error_response(
+            StatusCode::FORBIDDEN,
+            req.id.as_ref(),
+            -32003,
+            "Widget resources require a separate OAuth permission",
+            None,
+        );
+    }
     if public_lab_guard
         && req.method == "tools/call"
         && !funnel_lab_tool_allowed(req.params.get("name").and_then(Value::as_str))
@@ -3393,10 +3426,241 @@ mod oauth_mcp_admission_tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/secret-slug/mcp");
+        // R9 verifies real localhost HTTP consent alongside the protected MCP.
+        let browser_origin = format!("http://localhost:{}", addr.port());
+        assert!(oauth.verify_document_for_test(&json!({
+            "client_id": "https://chatgpt.com/oauth/client.json",
+            "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"]
+        })));
+        let pkce = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let mut auth_url = reqwest::Url::parse(&format!("{browser_origin}/authorize")).unwrap();
+        auth_url
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", "https://chatgpt.com/oauth/client.json")
+            .append_pair(
+                "redirect_uri",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+            )
+            .append_pair("resource", RESOURCE)
+            .append_pair("scope", "catdesk:read")
+            .append_pair("state", "r9-browser-generated-csrf-state-123456")
+            .append_pair("code_challenge", &pkce)
+            .append_pair("code_challenge_method", "S256");
+        let start = client.get(auth_url).send().await.unwrap();
+        assert_eq!(start.status(), reqwest::StatusCode::OK);
+        let cookie_header = start.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(cookie_header.contains("Secure; HttpOnly; SameSite=Lax"));
+        let cookie = cookie_header.split(';').next().unwrap().to_owned();
+        let page = start.text().await.unwrap();
+        assert!(!page.contains("name=\"owner_key\""));
+        let id = page
+            .split("name=\"request_id\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let finish_url = format!("{browser_origin}/authorize/approve");
+        let waiting = no_redirect
+            .post(&finish_url)
+            .header(reqwest::header::ORIGIN, &browser_origin)
+            .header(reqwest::header::COOKIE, &cookie)
+            .form(&[("request_id", id.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(waiting.status(), reqwest::StatusCode::FORBIDDEN);
+        owner_ui.approve_locally(&id, OWNER).await.unwrap();
+        let wrong_origin = no_redirect
+            .post(&finish_url)
+            .header(reqwest::header::ORIGIN, ISSUER)
+            .header(reqwest::header::COOKIE, &cookie)
+            .form(&[("request_id", id.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_origin.status(), reqwest::StatusCode::FORBIDDEN);
+        let approved = no_redirect
+            .post(&finish_url)
+            .header(reqwest::header::ORIGIN, &browser_origin)
+            .header(reqwest::header::COOKIE, &cookie)
+            .form(&[("request_id", id.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+        let callback = reqwest::Url::parse(
+            approved.headers()[reqwest::header::LOCATION]
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(callback.host_str(), Some("chatgpt.com"));
+        let code = callback
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .to_string();
+        assert_eq!(
+            callback
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .unwrap()
+                .1,
+            "r9-browser-generated-csrf-state-123456"
+        );
+        let token_form = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("code_verifier", VERIFIER),
+            ("client_id", "https://chatgpt.com/oauth/client.json"),
+            (
+                "redirect_uri",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+            ),
+            ("resource", RESOURCE),
+        ];
+        let token_reply = client
+            .post(format!("{browser_origin}/token"))
+            .form(&token_form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(token_reply.status(), reqwest::StatusCode::OK);
+        let minted: Value = token_reply.json().await.unwrap();
+        let browser_token = minted["access_token"].as_str().unwrap();
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth(browser_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED
+        );
+        let code_replay = client
+            .post(format!("{browser_origin}/token"))
+            .form(&token_form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code_replay.status(), reqwest::StatusCode::BAD_REQUEST);
+        let consent_replay = no_redirect
+            .post(&finish_url)
+            .header(reqwest::header::ORIGIN, &browser_origin)
+            .header(reqwest::header::COOKIE, &cookie)
+            .form(&[("request_id", id.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(consent_replay.status(), reqwest::StatusCode::FORBIDDEN);
+        let widget = client
+            .get(format!("http://{addr}/secret-slug/agents/path-state"))
+            .bearer_auth(browser_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(widget.status(), reqwest::StatusCode::FORBIDDEN);
         let unsigned = client.get(&url).send().await.unwrap();
         assert_eq!(unsigned.status(), reqwest::StatusCode::UNAUTHORIZED);
         let signed = client.get(&url).bearer_auth(&token).send().await.unwrap();
         assert_eq!(signed.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        let inventory = json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        });
+        let listed = client
+            .post(&url)
+            .json(&inventory)
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), reqwest::StatusCode::OK);
+        let listing: Value = listed.json().await.unwrap();
+        for tool in listing["result"]["tools"].as_array().unwrap() {
+            assert!(
+                funnel_lab_tool_allowed(tool["name"].as_str()),
+                "OAuth advertised a tool outside its scope: {}",
+                tool["name"]
+            );
+        }
+        // Both HTTP and dispatch must reject actions outside the fixed
+        // OAuth read-only allowlist, even in Local transport mode.
+        let disallowed = ["run", "command"].join("_");
+        let payload = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {
+                "name": disallowed, "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let denied = client
+            .post(&url)
+            .json(&payload)
+            .header("Mcp-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", &disallowed)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+        for (method, name, params) in [
+            ("resources/list", "", json!({})),
+            (
+                "resources/read",
+                "ui://widget/catdesk-dashboard.html",
+                json!({"uri":"ui://widget/catdesk-dashboard.html"}),
+            ),
+        ] {
+            let request = json!({
+                "jsonrpc":"2.0", "id": 10, "method":method,
+                "params": {
+                    "uri": params.get("uri").cloned().unwrap_or(Value::Null),
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities":{}
+                    }
+                }
+            });
+            let blocked = client
+                .post(&url)
+                .json(&request)
+                .header("Mcp-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", method)
+                .header("Mcp-Name", name)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                blocked.status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "widget resource {method} was exposed"
+            );
+        }
         let spoofed = client
             .get(&url)
             .header(reqwest::header::HOST, "public.example")
@@ -3433,6 +3697,16 @@ mod oauth_mcp_admission_tests {
         shared.lock().await.tailscale_owned = false;
         // Local owner emergency revocation propagates to the same HTTP state.
         owner_ui.revoke_all_locally(OWNER).await.unwrap();
+        let revoked_browser_token = client
+            .get(&url)
+            .bearer_auth(browser_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            revoked_browser_token.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         assert_eq!(
             client
                 .get(&url)
