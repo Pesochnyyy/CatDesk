@@ -140,9 +140,7 @@ pub async fn guard(
                     .as_ref()
                     .expect("OAuth route")
                     .approval_origin();
-                if headers
-                    .get(header::ORIGIN)
-                    .and_then(|value| value.to_str().ok())
+                if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok())
                     != Some(expected_origin)
                 {
                     return StatusCode::FORBIDDEN.into_response();

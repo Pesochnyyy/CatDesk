@@ -542,6 +542,11 @@ has no public owner approval interface.</p>
     );
     let mut response = Html(html).into_response();
     base_headers(&mut response);
+    // Unlike no-referrer, same-origin preserves Chrome's Origin header for
+    // HTML form POSTs. Cross-origin referrer leakage remains disallowed.
+    response
+        .headers_mut()
+        .insert(header::REFERRER_POLICY, "same-origin".parse().unwrap());
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
@@ -571,17 +576,10 @@ fn cookie_value(headers: &HeaderMap) -> Option<String> {
     found
 }
 
-fn origin_valid(headers: &HeaderMap, issuer: &str) -> bool {
-    headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        == Some(issuer)
-}
-
 async fn approve(State(state): State<OAuthHttpState>, headers: HeaderMap, body: Bytes) -> Response {
-    // Browser forms always provide an Origin in modern browsers; no silent
-    // fallback to Host/X-Forwarded-Host which a proxy client could forge.
-    if !origin_valid(&headers, state.approval_origin()) {
+    // An exact Origin is mandatory. The consent page uses a same-origin
+    // referrer policy so Chrome sends its actual Origin on HTML form POST.
+    if headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) != Some(state.approval_origin()) {
         return failure(StatusCode::FORBIDDEN, "access_denied");
     }
     // The public/browser endpoint NEVER receives or verifies owner keys.
@@ -802,6 +800,15 @@ mod tests {
     async fn prepare_consent(router: &Router) -> (String, String) {
         let response = call(router, request("GET", &authorize_url())).await;
         assert_eq!(response.status(), StatusCode::OK);
+        // Chrome sends Origin:null for form POST under no-referrer, which
+        // breaks strict CSRF origin checks. Same-origin is required here.
+        assert_eq!(
+            response
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("same-origin")
+        );
         let cookie = response
             .headers()
             .get(header::SET_COOKIE)

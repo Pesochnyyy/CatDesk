@@ -3722,6 +3722,111 @@ mod oauth_mcp_admission_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Real installed Chrome with a throwaway profile; no public transport.
+    /// The browser callback is intercepted before contacting ChatGPT.
+    #[tokio::test]
+    #[ignore = "requires Google Chrome and Node.js on macOS"]
+    async fn r10_real_chrome_cookie_consent_and_revoke() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let root = temp_path("original-catdesk-r10-chrome");
+        std::fs::create_dir_all(&root).unwrap();
+        let work = root.join("workspace");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut app = AppState::new_for_test(
+            8787,
+            work.to_string_lossy().into_owned(),
+            root.join("config.toml"),
+        )
+        .unwrap();
+        app.transport = TransportKind::Local;
+        app.transport_url = None;
+        app.tailscale_owned = false;
+        app.funnel_binding = None;
+        app.mode = Mode::Computer;
+        app.tool_mode = ToolMode::ReadOnly;
+        app.sandbox_enabled = true;
+        app.handoff_enabled = false;
+        app.mcp_slug = "secret-slug".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        app.port = port;
+        let shared = Arc::new(Mutex::new(app));
+        let oauth = OAuthHttpState::new_local_acceptance(
+            OAuthSettings::new(ISSUER, RESOURCE).unwrap(),
+            OWNER,
+            port,
+        )
+        .unwrap();
+        assert!(oauth.verify_document_for_test(&json!({
+            "client_id":"https://chatgpt.com/oauth/client.json",
+            "redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],
+            "token_endpoint_auth_methods_supported":["none"],
+            "grant_types":["authorization_code"],"response_types":["code"]
+        })));
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let router = router_with_oauth_admission(
+            shared,
+            None,
+            CommandJobManager::new(),
+            "/secret-slug/mcp".into(),
+            ui_tx,
+            Some(oauth.clone()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut chrome = tokio::process::Command::new("node")
+            .arg(format!(
+                "{}/scripts/oauth_r10_chrome_acceptance.mjs",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .env("CATDESK_R10_BASE", format!("http://localhost:{port}"))
+            .env("CATDESK_R10_RESOURCE", RESOURCE)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut child_in = chrome.stdin.take().unwrap();
+        let mut lines = BufReader::new(chrome.stdout.take().unwrap()).lines();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(25), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            first.starts_with("BROWSER_CONSENT="),
+            "Chrome did not establish session"
+        );
+        oauth
+            .approve_locally(first.trim_start_matches("BROWSER_CONSENT="), OWNER)
+            .await
+            .unwrap();
+        child_in.write_all(b"APPROVE\n").await.unwrap();
+        let token = tokio::time::timeout(std::time::Duration::from_secs(25), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(token, "BROWSER_TOKEN_VALID");
+        oauth.revoke_all_locally(OWNER).await.unwrap();
+        child_in.write_all(b"REVOKE\n").await.unwrap();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(15), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(done, "BROWSER_R10_PASS");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(8), chrome.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success(), "Chrome script exited unsuccessfully");
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn real_mcp_route_enforces_oauth_without_bearer_downgrade() {
         let root = temp_path("original-catdesk-oauth-mcp");
